@@ -159,12 +159,14 @@
   }
 
   // ---------------------------------------------------------------- playback core
-  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0;
+  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0;
   const tried = new Set();
 
   // ---------------------------------------------------------------- ad-free audio (MacBook relay)
   // The Downloader relay on the MacBook streams the song's audio straight from YouTube (yt-dlp) → no ads, and it
-  // plays in the Hi-Fi engine so the EQ works too. Offline relay / failure → regular YouTube player.
+  // plays in the Hi-Fi engine so the EQ works too. While "Bebas iklan" is on songs never fall back to the YouTube
+  // player (that is where the ads come from): a dropped tunnel is looked up again and the stream resumes at the same
+  // spot, a song the relay can't fetch tries another upload, and an offline relay is waited for.
   const AMT = window.AMATU;
   const R = { url: new URLSearchParams(location.search).get('relay') || null, ok: false, wait: null, at: 0 };
   const rtoken = () => (AMT && AMT.sess() && AMT.sess().t) || '';
@@ -193,37 +195,82 @@
     })();
     return R.wait;
   }
-  const AF = new Map();   // video id → promise of stream URL (also used to prefetch the next songs)
-  function adFreeUrl(id) {
-    const c = AF.get(id);
-    if (c && Date.now() - c.t < 3 * 3600e3) return c.p;
-    const p = (async () => {
-      if (!(await relay())) return null;
-      const r = await fetch(R.url + '/api/play?id=' + encodeURIComponent(id), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(25000) });
+  // video id → promise of the relay stream path (/api/a/<token>); the path outlives tunnel address changes
+  const AF = new Map();
+  function playPath(id) {
+    const q = () => fetch(R.url + '/api/play?id=' + encodeURIComponent(id), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(25000) });
+    return (async () => {
+      if (!(await relay())) throw new Error('offline');
+      let r;
+      try { r = await q(); }
+      catch (e) { if (!(await relay(true))) throw new Error('offline'); r = await q(); }   // tunnel moved → look it up again
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.u) throw new Error(j.error || 'relay ' + r.status);
-      return R.url + j.u;
-    })().catch((e) => { AF.delete(id); if (!/relay \d|tidak|Audio/.test(e.message)) { R.ok = false; R.at = 0; } return null; });
-    AF.set(id, { p, t: Date.now() });
-    if (AF.size > 200) AF.delete(AF.keys().next().value);
-    return p;
+      return j.u;
+    })();
   }
-  const afBlocked = (id) => Date.now() - (S.noAf[id] || 0) < 864e5;   // failed recently → YouTube player for a day
+  function adFreeUrl(id, fresh) {
+    let c = AF.get(id);
+    if (fresh || !c || Date.now() - c.t > 3 * 3600e3) {
+      c = { p: playPath(id), t: Date.now() };
+      AF.set(id, c);
+      c.p.catch(() => { if (AF.get(id) === c) AF.delete(id); });
+      if (AF.size > 200) AF.delete(AF.keys().next().value);
+    }
+    return c.p.then((u) => R.url + u, (e) => { if (e.message !== 'offline' && /fetch|network|abort|timeout/i.test(e.message)) { R.ok = false; R.at = 0; } return null; });
+  }
   const adFreeOn = () => S.set.adFree && (!!AMT || !!R.url);   // ?relay=… = local test relay
   const wantsVideo = (t) => vidOverride.k === key(t) && vidOverride.v === true;
   async function ytSpec(t, id) {
-    if (adFreeOn() && !wantsVideo(t) && !afBlocked(id)) {
-      const url = await adFreeUrl(id);
-      if (url) return { eng: 'au', url, ar: id };
+    if (!adFreeOn() || wantsVideo(t)) return { eng: 'yt', id };
+    let url = await adFreeUrl(id);
+    if (!url && !R.ok && (await relay(true))) url = await adFreeUrl(id, true);
+    return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id, off: !R.ok };
+  }
+  // relay offline: stay silent (no YouTube ads) and start the song as soon as the MacBook answers again
+  let afWaitTok = 0;
+  function waitRelay(tok, at) {
+    if (afWaitTok === tok) return;
+    afWaitTok = tok;
+    Engine.stop(); $('#bar').classList.add('loading');
+    toast('Server bebas iklan (MacBook) belum tersambung — menunggu, tanpa iklan YouTube', 'err');
+    const tick = async () => {
+      if (tok !== playTok) return;
+      if (await relay(true)) { if (tok === playTok) { afWaitTok = 0; startCur({ start: at }); } return; }
+      setTimeout(tick, 5000);
+    };
+    setTimeout(tick, 3000);
+  }
+  // the relay can't fetch this upload → another upload of the same song, still through the relay
+  async function afAlt(t, tok) {
+    while (altTries < 3) {
+      altTries++;
+      const d = await API.search(`${t.title} ${artistsText(t)}`, altTries === 1 ? 'songs' : 'videos').catch(() => null);
+      if (tok !== playTok) return;
+      const alt = d && API.tracksOf(d.items).find((x) => !tried.has(x.id));
+      if (!alt) continue;
+      tried.add(alt.id);
+      const url = await adFreeUrl(alt.id, true);
+      if (tok !== playTok) return;
+      if (url) {
+        const orig = t.src === 'yt' ? t.id : S.match[t.id];
+        if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
+        curSpec = { eng: 'au', url, ar: alt.id }; afFix = 0;
+        Engine.load(curSpec, { autoplay: true });
+        renderNow();
+        return;
+      }
+      if (!R.ok) return waitRelay(tok, 0);
     }
-    return { eng: 'yt', id };
+    toast('Tidak dapat memutar "' + t.title + '" tanpa iklan — lanjut', 'err');
+    setTimeout(() => { if (tok === playTok) next(true); }, 1200);
   }
   // warm the relay for the next songs so they start instantly
   function prefetchNext(withCur) {
     if (!adFreeOn() || !R.ok) return;
     for (const t of Q.list.slice(Q.i + (withCur ? 0 : 1), Q.i + 3)) {
       const id = t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null;
-      if (id && !afBlocked(id)) adFreeUrl(id);
+      if (id) adFreeUrl(id);
     }
   }
 
@@ -254,12 +301,17 @@
     const t = cur();
     if (!t) return;
     const tok = ++playTok;
-    listened = 0; counted = false; fadingOut = false; altTries = 0; tried.clear();
+    listened = 0; counted = false; fadingOut = false; altTries = 0; afFix = 0; tried.clear();
     renderNow(); saveQ();
     $('#bar').classList.add('loading');
     const spec = await specFor(t).catch(() => null);
     if (tok !== playTok) return;
     if (!spec) { toast('Lagu tidak tersedia', 'err'); return next(true); }
+    if (spec.eng === 'af') {
+      curSpec = null; tried.add(spec.ar);
+      if (spec.off) return waitRelay(tok, opt.start || 0);
+      Engine.stop(); return afAlt(t, tok);
+    }
     curSpec = spec;
     if (spec.id) tried.add(spec.id);
     const fade = S.set.fade && opt.autoplay !== false && !spec.live;
@@ -379,12 +431,17 @@
     if (!t) return;
     const tok = playTok;
     if (err.eng === 'au' && curSpec && curSpec.ar) {
+      // stream broke: usually the tunnel got a new address mid-song → same stream, same spot
       const id = curSpec.ar, at = Engine.time();
-      AF.delete(id); S.noAf[id] = Date.now(); const ks = Object.keys(S.noAf); if (ks.length > 300) delete S.noAf[ks[0]]; save();
-      toast('Mode bebas iklan gagal untuk lagu ini — diputar lewat YouTube', 'err');
-      curSpec = { eng: 'yt', id }; tried.add(id);
-      Engine.load(curSpec, { autoplay: true, start: at > 2 ? at : 0 });
-      return;
+      if (afFix++ < 3) {
+        if (!(await relay(true))) return tok === playTok && waitRelay(tok, at);
+        const url = await adFreeUrl(id, afFix > 1);
+        if (tok !== playTok) return;
+        if (url) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }); return; }
+        if (!R.ok) return waitRelay(tok, at);
+      }
+      tried.add(id);
+      return afAlt(t, tok);
     }
     if (err.eng === 'yt' && altTries < 3) {
       altTries++;
@@ -1135,6 +1192,7 @@
     if (t.src === 'radio') return ['hf', 'RADIO'];
     if (t.src === 'file') return ['hf', 'HI-FI'];
     if (e === 'au' && curSpec && curSpec.ar) return ['hf', 'BEBAS IKLAN · HI-FI'];
+    if (!e && adFreeOn() && (t.src === 'yt' || t.src === 'sp')) return ['hf', 'BEBAS IKLAN · MENUNGGU SERVER'];
     if (e === 'au') return ['hf', 'HI-FI · PREVIEW'];
     if (e === 'sp') return ['sp', 'SPOTIFY'];
     if (t.src === 'sp') return ['yt', 'SPOTIFY → YT'];
@@ -1176,14 +1234,14 @@
     const t = cur();
     if (Engine.eng !== 'yt' || !t) return false;
     if (vidOverride.k === key(t) && vidOverride.v != null) return vidOverride.v;
-    return S.set.video && t.kind === 'video' && !(adFreeOn() && curSpec && curSpec.id && !afBlocked(curSpec.id) && R.ok);
+    return S.set.video && t.kind === 'video' && !adFreeOn();   // ad-free: video only when asked for (YouTube player)
   };
   function toggleVideo() {
     const v = !isVideoMode();
     vidOverride = { k: curKey(), v }; dockHidden = false;
     // ad-free audio has no picture: the video needs the YouTube player (and back to ad-free when turned off)
-    if (v && Engine.eng === 'au' && curSpec && curSpec.ar) { curSpec = { eng: 'yt', id: curSpec.ar }; Engine.load(curSpec, { autoplay: Engine.playing(), start: Engine.time() }); }
-    else if (!v && Engine.eng === 'yt' && adFreeOn() && curSpec && curSpec.id && !afBlocked(curSpec.id)) {
+    if (v && Engine.eng === 'au' && curSpec && curSpec.ar) { toast('Video memakai pemutar YouTube — bisa ada iklan. Matikan Video untuk kembali bebas iklan.'); curSpec = { eng: 'yt', id: curSpec.ar }; Engine.load(curSpec, { autoplay: Engine.playing(), start: Engine.time() }); }
+    else if (!v && Engine.eng === 'yt' && adFreeOn() && curSpec && curSpec.id) {
       const id = curSpec.id, at = Engine.time(), was = Engine.playing(), tok = playTok;
       adFreeUrl(id).then((url) => { if (url && tok === playTok && !isVideoMode()) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: was, start: at }); } });
     }
@@ -1534,7 +1592,7 @@
         const sb = e.target.closest('[data-seg] [data-v]');
         if (sb) { const k = sb.parentNode.dataset.seg; const v = sb.dataset.v; S.set[k] = isNaN(+v) ? v : +v; $$('button', sb.parentNode).forEach((b) => b.classList.toggle('on', b === sb)); save(); if (k === 'spMode' && route.name === 'sp') render(); }
         const w = e.target.closest('[data-sw]');
-        if (w) { const k = w.dataset.sw; S.set[k] = !S.set[k]; w.classList.toggle('on', S.set[k]); save(); if (k === 'video') renderNow(); if (k === 'adFree') { S.noAf = {}; afStatus(c); } }
+        if (w) { const k = w.dataset.sw; S.set[k] = !S.set[k]; w.classList.toggle('on', S.set[k]); save(); if (k === 'video') renderNow(); if (k === 'adFree') { S.noAf = {}; afStatus(c); if (cur()) startCur({ start: Engine.time(), autoplay: Engine.playing() }); } }
       };
       afStatus(c);
       $('#sExp', c).onclick = exportAll;
@@ -1548,7 +1606,7 @@
     if (!el) return;
     if (!AMT && !R.url) { el.textContent = 'Perlu masuk Portal AMATU.'; return; }
     el.textContent = 'Memeriksa server…';
-    relay(true).then((ok) => { el.textContent = ok ? '✓ Server MacBook aktif.' : '✕ Server MacBook offline — sementara lewat YouTube (bisa ada iklan).'; el.style.color = ok ? 'var(--ac)' : '#e5484d'; });
+    relay(true).then((ok) => { el.textContent = ok ? '✓ Server MacBook aktif.' : '✕ Server MacBook offline — lagu menunggu server (tidak memakai YouTube, jadi tanpa iklan).'; el.style.color = ok ? 'var(--ac)' : '#e5484d'; });
   }
 
   // ---------------------------------------------------------------- media session + PiP
@@ -1738,7 +1796,7 @@
     const L = LISTS.get((el.closest('[data-l]') || {}).dataset ? el.closest('[data-l]').dataset.l : '');
     const t = L && L.tracks[+el.dataset.i];
     const id = t && (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
-    if (id && !afBlocked(id)) adFreeUrl(id);
+    if (id) adFreeUrl(id);
   };
   document.addEventListener('pointerover', (e) => { clearTimeout(hoverT); if (!touch && e.target.closest && e.target.closest('.pi, .pb')) hoverT = setTimeout(() => warm(e), 300); }, { passive: true });
   document.addEventListener('pointerdown', warm, { passive: true, capture: true });
