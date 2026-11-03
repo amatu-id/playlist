@@ -17,7 +17,7 @@
   const DEF = {
     v: 1, likes: [], lists: [], saved: [], hist: [], plays: {}, recentCtx: [], recent: [], match: {}, alt: {}, noAf: {},
     eq: JSON.parse(JSON.stringify(FX.DEF)), myPresets: {},
-    set: { spMode: 'yt', fade: 2, autoRadio: true, video: true, panel: true, ptab: 'np', adFree: true },
+    set: { spMode: 'yt', fade: 2, autoRadio: true, video: true, panel: true, ptab: 'np', adFree: true, floatLy: true },
     vol: 0.8, muted: false, rate: 1, shuffle: false, repeat: 0, listenSec: 0,
   };
   function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) || d; } catch (e) { return d; } }
@@ -1314,14 +1314,16 @@
   // full screen
   const full = $('#full');
   let fTool = null;
-  function openFull() {
+  function openFull(tool) {
     full.hidden = false;
-    if (!fTool && !mobile()) fTool = 'lyrics';
+    if (tool) fTool = tool;
+    else if (!fTool && !mobile()) fTool = 'lyrics';
     renderNow();
   }
   function closeFull() { full.hidden = true; if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); }
   $('#fClose').onclick = closeFull;
-  $('#bArt').onclick = $('.b-meta').onclick = (e) => { if (e.target.closest('a')) return; if (mobile() || !cur()) openFull(); else togglePanelTab('np'); };
+  // anywhere on the bar (not its buttons, links or sliders) opens the playing song's lyrics full screen
+  $('#bar').addEventListener('click', (e) => { if (e.target.closest('button, a, .range, .vol')) return; openFull(cur() ? 'lyrics' : null); });
   $('#tFull').onclick = () => { openFull(); if (!mobile()) document.documentElement.requestFullscreen && document.documentElement.requestFullscreen().catch(() => {}); };
   $('#fMore').onclick = (e) => { const t = cur(); if (t) trackMenu(t, e.currentTarget); };
   $$('.f-tools .chip').forEach((b) => b.onclick = () => {
@@ -1355,6 +1357,7 @@
   bind(['#bLike', '#fLike'], () => toggleLike(cur()));
   $('#tQueue').onclick = () => togglePanelTab('queue');
   $('#tLyr').onclick = () => togglePanelTab('lyrics');
+  $('#tFly').onclick = () => { S.set.floatLy = !S.set.floatLy; save(); flyKey = ''; toast(S.set.floatLy ? 'Lirik mengambang aktif' : 'Lirik mengambang disembunyikan'); };
   $('#tEq').onclick = () => togglePanelTab('eq');
   $('#goBack').onclick = () => history.back();
   $('#goFwd').onclick = () => history.forward();
@@ -1453,8 +1456,8 @@
     Engine.seek(Math.max(0, LY.data.synced[+p.dataset.ly].t - lyOff));
     lyUserScroll = 0;
   });
-  for (const el of [pbody, $('#fRight')]) el.addEventListener('wheel', () => { lyUserScroll = Date.now(); }, { passive: true });
-  for (const el of [pbody, $('#fRight')]) el.addEventListener('touchmove', () => { lyUserScroll = Date.now(); }, { passive: true });
+  for (const el of [pbody, $('#fRight'), $('#flyB')]) el.addEventListener('wheel', () => { lyUserScroll = Date.now(); }, { passive: true });
+  for (const el of [pbody, $('#fRight'), $('#flyB')]) el.addEventListener('touchmove', () => { lyUserScroll = Date.now(); }, { passive: true });
   function syncLyrics(time) {
     if (!LY.data || !LY.data.synced) return;
     const L = LY.data.synced, tt = time + lyOff + 0.15;
@@ -1466,11 +1469,39 @@
       const ps = box.children;
       for (let j = 0; j < ps.length; j++) { ps[j].classList.toggle('now', j === i); ps[j].classList.toggle('past', j < i); }
       if (i >= 0 && Date.now() - lyUserScroll > 3500) {
-        const sc = box.closest('#pbody, .f-right'), p = ps[i];
+        const sc = box.closest('#pbody, .f-right, .fly-b'), p = ps[i];
         if (sc && p) sc.scrollTo({ top: p.offsetTop - sc.clientHeight * 0.36, behavior: 'smooth' });
       }
     }
   }
+
+  // floating lyrics: left third of the screen while a song plays (checked every tick, so no init-order worries)
+  const fly = $('#fly'), flyB = $('#flyB');
+  let flyKey = '', flyOff = 0;
+  function updateFly(tm, d) {
+    const t = cur(), D = LY.data;
+    const has = !!(t && LY.state === 'ok' && D && !D.instrumental);
+    const want = S.set.floatLy && has && full.hidden && innerWidth > 700;
+    $('#tFly').classList.toggle('on', !!S.set.floatLy);
+    // short pauses (buffering, song change) keep it up; a real pause fades it out after 1.5 s
+    if (Engine.playing()) flyOff = 0; else if (!flyOff) flyOff = Date.now();
+    const show = want && (!flyOff || Date.now() - flyOff < 1500);
+    fly.classList.toggle('on', show);
+    if (!has) { flyKey = ''; return; }
+    const k = LY.key + '|' + (LY.tr ? 1 : 0) + '|' + (D.synced ? 's' : 'p');
+    if (k !== flyKey) {
+      flyKey = k;
+      $('#flyT').textContent = t.title;
+      flyB.innerHTML = D.synced
+        ? `<div class="lyr">${D.synced.map((l, i) => `<p data-ly="${i}">${esc(l.x || '♪')}${lyTr(i)}</p>`).join('')}</div>`
+        : `<div class="lyr plain">${D.plain.split('\n').map((l, i) => `<p>${esc(l) || '&nbsp;'}${lyTr(i)}</p>`).join('')}</div>`;
+      flyB.scrollTop = 0; lyLast = -2;
+    }
+    // unsynced lyrics follow the song's progress
+    if (show && !D.synced && d && Date.now() - lyUserScroll > 3500) flyB.scrollTop = Math.max(0, (flyB.scrollHeight - flyB.clientHeight) * Math.min(1, tm / d) - flyB.clientHeight * 0.2);
+  }
+  $('#flyFull').onclick = () => openFull('lyrics');
+  $('#flyX').onclick = () => { S.set.floatLy = false; save(); toast('Lirik mengambang disembunyikan — tampilkan lagi dengan tombol lirik di bar bawah'); };
 
   // ---------------------------------------------------------------- EQ
   const bc = 'BroadcastChannel' in window ? new BroadcastChannel('amatu-eq') : null;
@@ -1629,6 +1660,7 @@
       <div class="set-row"><div class="l"><b>Transisi halus</b><span>Fade-in/out antar lagu (detik)</span></div>${seg('fade', [[0, 'Mati'], [2, '2'], [4, '4'], [6, '6'], [10, '10']])}</div>
       <div class="set-row"><div class="l"><b>Autoplay lagu serupa</b><span>Saat antrean habis, lanjut otomatis dengan lagu mirip</span></div>${sw('autoRadio')}</div>
       <div class="set-row"><div class="l"><b>Tampilkan video musik</b><span>Video klip tampil otomatis; lagu audio menampilkan artwork (bisa diubah per lagu dengan tombol Video)</span></div>${sw('video')}</div>
+      <div class="set-row"><div class="l"><b>Lirik mengambang</b><span>Lirik lagu yang diputar melayang di sepertiga kiri layar (layar lebar)</span></div>${sw('floatLy')}</div>
       <div class="set-row"><div class="l"><b>Pintasan keyboard</b><span>Spasi putar/jeda · ←/→ maju-mundur 5 dtk · Shift+←/→ lagu sebelumnya/berikutnya · ↑/↓ volume · M bisu · L suka · S acak · R ulangi · Q antrean · E EQ · F layar penuh · / cari</span></div></div>
       <div class="set-row"><div class="l"><b>Data</b><span>Playlist, lagu disukai & EQ tersinkron ke akun Portal AMATU.</span></div><div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end"><button class="btn sm" id="sExp">Ekspor</button><button class="btn sm" id="sImp">Impor</button><button class="btn sm" id="sClr">Hapus riwayat</button></div></div>`, (c) => {
       c.onclick = (e) => {
@@ -1782,6 +1814,7 @@
     $('#tDur').textContent = isRadio ? '' : fmt(d); $('#fDur').textContent = isRadio ? '' : fmt(d);
     $('#seek').style.setProperty('--b', Engine.buffered() * 100 + '%');
     $('#mProg').style.width = p * 100 + '%';
+    updateFly(tm, d);
     if (PIP) { const i = PIP.document.querySelector('.pp i'); if (i) i.style.width = p * 100 + '%'; }
     if (!t || !Engine.eng) return;
     syncLyrics(tm);
