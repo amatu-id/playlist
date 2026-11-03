@@ -1,4 +1,4 @@
-// api.js — catalogue (YouTube Music + Spotify via edge fn), lyrics (lrclib), radio (radio-browser)
+// api.js — catalogue (YouTube Music + Spotify via edge fn), lyrics (lrclib / YouTube Music) + translation, radio (radio-browser)
 window.API = (function () {
   const EDGE = 'https://ieyqxmzztoxgpvwexbkj.supabase.co/functions/v1/amatu-music';
   const mem = new Map();
@@ -51,26 +51,95 @@ window.API = (function () {
     return { id: best.id, thumb: best.thumb };
   }
 
-  // lyrics from lrclib.net (synced when available)
-  async function lyrics(t) {
-    const artist = (t.artists[0] || {}).name || '';
-    const title = t.title.replace(/\s*[\(\[](feat|ft|with|official|lyric|video|audio|live|remaster)[^\)\]]*[\)\]]/gi, '').trim();
-    const pick = (x) => x && (x.syncedLyrics || x.plainLyrics) ? { synced: parseLrc(x.syncedLyrics), plain: x.plainLyrics || '', instrumental: x.instrumental } : null;
-    try {
-      const p = new URLSearchParams({ artist_name: artist, track_name: title });
-      if (t.sec) p.set('duration', t.sec);
-      const r = await fetch('https://lrclib.net/api/get?' + p);
-      if (r.ok) { const x = pick(await r.json()); if (x) return x; }
-    } catch (e) { /* fall through to search */ }
-    const r = await fetch('https://lrclib.net/api/search?' + new URLSearchParams({ q: `${title} ${artist}`.trim() }));
-    const arr = r.ok ? await r.json() : [];
+  // Lyrics, first source that has them: lrclib.net (often synced) → YouTube Music (Musixmatch / LyricFind).
+  // Video titles like "Song - Artist | Lirik Lagu (Official Video)" are cleaned into title + artist first.
+  const lnorm = (s) => (s || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/\(.*?\)|\[.*?\]|feat\..*$|ft\..*$/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+  function lyricQuery(t) {
+    let title = t.title.split(/\s*[|｜•]+\s*|\s\/\/\s/)[0]
+      .replace(/\s*[\(\[][^\)\]]*(feat|ft\.|with|official|lyric|lirik|video|audio|live|remaster|cover|version|mv|visuali[sz]er|karaoke)[^\)\]]*[\)\]]/gi, '')
+      .replace(/\b(official (music )?video|music video|lirik( lagu)?|lyrics?|video lirik|video klip|mv)\b/gi, '').trim();
+    let artist = ((t.artists[0] || {}).name || '').replace(/\s*-\s*topic$/i, '');
+    let alt = null;
+    const m = title.match(/^(.+?)\s[-–—]\s(.+)$/);
+    if (m) {
+      // "Artist - Song" or "Song - Artist": the side that matches the channel/artist name is the artist
+      const a = lnorm(artist);
+      if (a && (lnorm(m[1]).includes(a) || a.includes(lnorm(m[1])))) title = m[2];
+      else if (a && (lnorm(m[2]).includes(a) || a.includes(lnorm(m[2])))) title = m[1];
+      else if (t.kind === 'video') { title = m[1]; artist = m[2]; alt = { title: m[2], artist: m[1] }; }
+    }
+    const tidy = (x) => x.replace(/\s*[\(\[][^\)\]]*$/, '').replace(/[!?.]{2,}.*$/, '').replace(/\b(cover|karaoke|akustik|acoustic|kentrung|versi|version|remix|full)\b.*$/i, '').replace(/\s+/g, ' ').trim() || x.trim();
+    const q = { title: tidy(title), artist: artist.trim() };
+    q.alts = [q].concat(alt ? [{ title: tidy(alt.title), artist: alt.artist.trim() }] : []);
+    return q;
+  }
+  // lrclib sometimes stops answering: every call has a timeout and a dead lrclib is skipped for a while
+  let lrcDown = 0;
+  async function lrc(path) {
+    if (Date.now() - lrcDown < 120e3) return null;
+    try { const r = await fetch('https://lrclib.net/api/' + path, { signal: AbortSignal.timeout(7000) }); return r.ok ? await r.json() : null; }
+    catch (e) { if (e.name === 'TimeoutError' || e.name === 'TypeError') lrcDown = Date.now(); return null; }
+  }
+  async function lrclib(t) {
+    for (const q of lyricQuery(t).alts) {
+      const x = await lrclibOne(t, q.title, q.artist);
+      if (x) return x;
+    }
+    return null;
+  }
+  async function lrclibOne(t, title, artist) {
+    const pick = (x) => x && (x.syncedLyrics || x.plainLyrics || x.instrumental) ? { synced: parseLrc(x.syncedLyrics), plain: x.plainLyrics || '', instrumental: x.instrumental, source: 'lrclib' } : null;
+    const p = new URLSearchParams({ artist_name: artist, track_name: title });
+    if (t.sec) p.set('duration', t.sec);
+    const g = pick(await lrc('get?' + p));
+    if (g) return g;
+    const nt = lnorm(title);
     let best = null;
-    for (const x of arr) {
-      if (!x.syncedLyrics && !x.plainLyrics) continue;
-      if (!best) best = x;
-      if (x.syncedLyrics && t.sec && Math.abs(x.duration - t.sec) < 4) { best = x; break; }
+    const short = title.split(' ').length > 3 ? title.split(' ').slice(0, 3).join(' ') : '';   // "Song Artist" glued titles
+    for (const q of [`${title} ${artist}`.trim(), title, short].filter(Boolean)) {
+      const arr = (await lrc('search?' + new URLSearchParams({ q }))) || [];
+      for (const x of arr) {
+        if (!x.syncedLyrics && !x.plainLyrics) continue;
+        const xt = lnorm(x.trackName);
+        if (!nt || !(xt === nt || xt.includes(nt) || (nt.startsWith(xt) && xt.length >= Math.min(nt.length, 8)))) continue;   // a different song
+        if (!best) best = x;
+        if (x.syncedLyrics && t.sec && Math.abs(x.duration - t.sec) < 4) { best = x; break; }
+      }
+      if (best) break;
     }
     return pick(best);
+  }
+  async function ytLyrics(id) {
+    const d = await edge({ a: 'lyrics', id });
+    const l = d.lyrics;
+    return l && (l.plain || '').trim() ? { synced: l.synced && l.synced.length ? l.synced : null, plain: l.plain, source: l.source || 'YouTube Music' } : null;
+  }
+  async function lyrics(t, ytId) {
+    const a = await lrclib(t).catch(() => null);
+    if (a) return a;
+    return ytId ? ytLyrics(ytId).catch(() => null) : null;
+  }
+
+  // Indonesian translation per line (Google's Chrome translate endpoint — CORS-open, detects each line's language)
+  async function translate(lines, tl) {
+    tl = tl || 'id';
+    const out = new Array(lines.length).fill(''), lang = new Array(lines.length).fill('');
+    const idx = lines.map((l, i) => (l && l.trim() ? i : -1)).filter((i) => i >= 0);
+    for (let k = 0; k < idx.length; k += 80) {
+      const part = idx.slice(k, k + 80);
+      const r = await fetch('https://translate-pa.googleapis.com/v1/translateHtml', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json+protobuf', 'X-Goog-API-Key': 'AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520' },
+        body: JSON.stringify([[part.map((i) => lines[i]), 'auto', tl], 'wt_lib']),
+      });
+      if (!r.ok) throw new Error('translate ' + r.status);
+      const d = await r.json();
+      part.forEach((i, j) => {
+        out[i] = String((d[0] || [])[j] || '').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+        lang[i] = (d[1] || [])[j] || '';
+      });
+    }
+    return { lines: out, lang };
   }
   function parseLrc(s) {
     if (!s) return null;
@@ -99,5 +168,5 @@ window.API = (function () {
     return [];
   }
 
-  return { EDGE, edge, track, tracksOf, search, browse, radio, suggest, spotify, match, lyrics, stations };
+  return { EDGE, edge, track, tracksOf, search, browse, radio, suggest, spotify, match, lyrics, lyricQuery, translate, stations };
 })();

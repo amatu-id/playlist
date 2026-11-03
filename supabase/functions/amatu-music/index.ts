@@ -2,6 +2,7 @@
 // GET ?a=search&q=..&t=songs|videos|albums|artists|playlists|all
 //     ?a=browse&id=MPREb_..|VL..|UC..|FEmusic_home
 //     ?a=radio&v=<videoId>      ?a=suggest&q=..
+//     ?a=lyrics&id=<videoId>    (YouTube Music lyrics, timed when the Android client has them)
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-client-info',
@@ -19,8 +20,9 @@ const FILTER: Record<string, string> = {
 // deno-lint-ignore no-explicit-any
 type J = any;
 
-async function yt(ep: string, body: J): Promise<J> {
-  const b = { context: { client: { clientName: 'WEB_REMIX', clientVersion: '1.20241023.01.00', hl: 'en', gl: 'ID' } }, ...body };
+const WEB = { clientName: 'WEB_REMIX', clientVersion: '1.20241023.01.00' };
+async function yt(ep: string, body: J, client: J = WEB): Promise<J> {
+  const b = { context: { client: { ...client, hl: 'en', gl: 'ID' } }, ...body };
   const r = await fetch(`https://music.youtube.com/youtubei/v1/${ep}?prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -227,6 +229,34 @@ async function handle(u: URL) {
     walk(d, 0);
     return { items: items.filter((i) => i.id) };
   }
+  if (a === 'lyrics') {
+    const v = u.searchParams.get('id') || '';
+    const m = /"browseId":"(MPLYt[^"]+)"/.exec(JSON.stringify(await yt('next', { videoId: v })));
+    if (!m) return { lyrics: null };
+    let tl: J = null;
+    try {
+      const walk = (x: J, dep: number): void => {
+        if (tl || !x || typeof x !== 'object' || dep > 40) return;
+        if (x.timedLyricsModel) { tl = x.timedLyricsModel.lyricsData; return; }
+        for (const k in x) walk(x[k], dep + 1);
+      };
+      walk(await yt('browse', { browseId: m[1] }, { clientName: 'ANDROID_MUSIC', clientVersion: '7.27.52' }), 0);
+    } catch (_) { /* web text below */ }
+    const src = (x: string) => x.replace(/^(Source|Sumber):\s*/i, '');
+    if (tl && tl.timedLyricsData?.length) {
+      const L = tl.timedLyricsData.map((x: J) => ({ x: x.lyricLine || '', t: x.cueRange ? +x.cueRange.startTimeMilliseconds / 1000 : null }));
+      const timed = L.every((x: J) => x.t != null);
+      return { lyrics: { plain: L.map((x: J) => x.x).join('\n'), synced: timed ? L : null, source: src(tl.sourceMessage || '') } };
+    }
+    let plain = '', foot = '';
+    const walk2 = (x: J, dep: number): void => {
+      if (plain || !x || typeof x !== 'object' || dep > 40) return;
+      if (x.musicDescriptionShelfRenderer) { plain = txt(x.musicDescriptionShelfRenderer.description); foot = txt(x.musicDescriptionShelfRenderer.footer); return; }
+      for (const k in x) walk2(x[k], dep + 1);
+    };
+    walk2(await yt('browse', { browseId: m[1] }), 0);
+    return { lyrics: plain ? { plain, synced: null, source: src(foot) } : null };
+  }
   if (a === 'suggest') {
     const d = await yt('music/get_search_suggestions', { input: (u.searchParams.get('q') || '').slice(0, 100) });
     const out: string[] = [];
@@ -268,7 +298,7 @@ Deno.serve(async (req) => {
   const u = new URL(req.url);
   const key = u.search;
   const hit = cache.get(key);
-  const ttl = u.searchParams.get('a') === 'suggest' ? 3600e3 : 600e3;
+  const ttl = /^(suggest|lyrics)$/.test(u.searchParams.get('a') || '') ? 3600e3 : 600e3;
   if (hit && Date.now() - hit.t < ttl) return new Response(hit.v, { headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=600' } });
   try {
     const v = JSON.stringify(await handle(u));

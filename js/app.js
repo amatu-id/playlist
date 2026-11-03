@@ -1375,33 +1375,76 @@
   $('#tTimer').onclick = (e) => openMenu([{ head: 'Timer tidur' }].concat([5, 15, 30, 45, 60, 90].map((m) => ({ label: m + ' menit', run: () => { sleep.at = Date.now() + m * 60000; sleep.end = false; renderSleep(); toast(`Musik berhenti dalam ${m} menit`); } })), [{ label: 'Akhir lagu ini', run: () => { sleep.end = true; sleep.at = 0; renderSleep(); toast('Berhenti setelah lagu ini'); } }, { label: 'Matikan timer', check: !sleep.at && !sleep.end, run: () => { sleep.at = 0; sleep.end = false; renderSleep(); } }]), e.currentTarget);
 
   // ---------------------------------------------------------------- lyrics
-  const LY = { key: '', data: null, state: 'idle' };
+  // every song gets lyrics: lyric sites first, otherwise the MacBook relay writes them from the audio (Whisper).
+  // Lines not in Indonesian get an Indonesian translation underneath.
+  const LY = { key: '', data: null, state: 'idle', tr: null };
+  const LYC = new Map();   // track key → { data, tr } for this visit
   let lyOff = 0, lyLast = -2, lyUserScroll = 0;
-  async function loadLyrics(t) {
+  const ytIdOf = (t) => t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' ? S.match[t.id] || null : null;
+  const lyNorm = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  async function genLyrics(t, id) {
+    if (!(await relay())) return null;
+    const q = API.lyricQuery(t);
+    const r = await fetch(R.url + '/api/lyrics?' + new URLSearchParams({ id, hint: `${q.title}, ${q.artist}.` }), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(600e3) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || 'relay ' + r.status);
+    const L = (j.lines || []).filter((l) => lyNorm(l.x) !== lyNorm(`${q.title} ${q.artist}`));
+    if (!L.length) return { instrumental: true, gen: true };
+    return { synced: L, plain: L.map((l) => l.x).join('\n'), source: 'otomatis dari audio (AI)', gen: true };
+  }
+  async function loadLyrics(t, again) {
     const k = key(t);
-    if (LY.key === k) return;
-    LY.key = k; LY.data = null;
+    if (LY.key === k && !again) return;
+    LY.key = k; LY.data = null; LY.tr = null;
     if (t.src === 'radio') { LY.state = 'none'; refreshLyrics(); return; }
-    LY.state = 'loading'; lyOff = 0; refreshLyrics();
-    try {
-      const d = await API.lyrics(t);
+    const c = LYC.get(k);
+    if (c) { LY.data = c.data; LY.tr = c.tr; LY.state = 'ok'; refreshLyrics(); return; }
+    if (!again) { LY.state = 'loading'; lyOff = 0; refreshLyrics(); }
+    let d = null;
+    const id = t.src === 'sp' && !S.match[t.id] ? await API.match(t).then((m) => m && m.id).catch(() => null) : ytIdOf(t);
+    if (LY.key !== k) return;
+    d = await API.lyrics(t, id).catch(() => null);
+    if (LY.key !== k) return;
+    if (!d && id && (AMT || R.url)) {
+      LY.state = 'gen'; refreshLyrics();
+      d = await genLyrics(t, id).catch(() => null);
       if (LY.key !== k) return;
-      LY.data = d; LY.state = d ? 'ok' : 'none';
-    } catch (e) { if (LY.key === k) LY.state = 'none'; }
+      if (!d) {
+        // relay offline: try again until it answers, the song still gets its lyrics
+        LY.state = 'wait'; refreshLyrics();
+        setTimeout(() => { if (LY.key === k) loadLyrics(t, true); }, 15000);
+        return;
+      }
+    }
+    LY.data = d; LY.state = d ? 'ok' : 'none';
     refreshLyrics();
+    if (!d || d.instrumental) return;
+    LYC.set(k, { data: d, tr: null });
+    const lines = d.synced ? d.synced.map((l) => l.x) : d.plain.split('\n');
+    API.translate(lines).then((r) => {
+      const tr = r.lines.map((x, i) => (x && !/^(id|ms)$/.test(r.lang[i]) && lyNorm(x) !== lyNorm(lines[i]) ? x : ''));
+      if (!tr.some(Boolean)) return;
+      const e = LYC.get(k); if (e) e.tr = tr;
+      if (LY.key === k) { LY.tr = tr; refreshLyrics(); }
+    }).catch(() => { /* lyrics stay without translation */ });
   }
   function refreshLyrics() {
     if (activeTab() === 'lyrics') renderPanel();
     if (!full.hidden && fTool === 'lyrics') renderFullRight();
   }
+  const lyTr = (i) => (LY.tr && LY.tr[i] ? `<span class="ly-tr">${esc(LY.tr[i])}</span>` : '');
   function lyricsHtml() {
     const t = cur();
     if (!t) return empty('mic', 'Belum ada lagu');
     if (LY.state === 'loading') return loading();
-    if (LY.state !== 'ok' || !LY.data) return empty('mic', t.src === 'radio' ? 'Lirik tidak tersedia untuk radio' : 'Lirik tidak ditemukan', t.src === 'radio' ? '' : 'Belum ada lirik untuk lagu ini di database lirik.');
+    if (LY.state === 'gen') return `<div class="load"><div class="spin"></div></div>` + empty('mic', 'Membuat lirik dari audio…', 'Belum ada di database lirik — server MacBook mendengarkan lagunya dan menuliskan liriknya (±15–30 detik).');
+    if (LY.state === 'wait') return empty('mic', 'Menunggu server MacBook', 'Lirik lagu ini dibuat otomatis dari audio begitu server MacBook tersambung.');
+    if (LY.state !== 'ok' || !LY.data) return empty('mic', t.src === 'radio' ? 'Lirik tidak tersedia untuk radio' : 'Lirik tidak ditemukan', t.src === 'radio' ? '' : t.src === 'file' ? 'File lokal tidak bisa dicarikan liriknya.' : 'Masuk Portal AMATU agar lirik bisa dibuat otomatis.');
     if (LY.data.instrumental) return empty('music', 'Instrumental', 'Lagu ini tanpa vokal.');
-    if (LY.data.synced) return `<div class="lyr-h"><span>Lirik sinkron · lrclib</span><span class="off">Sinkron <button data-act="ly-off" data-d="-0.5">−</button><b class="lyo">${lyOff > 0 ? '+' : ''}${lyOff}s</b><button data-act="ly-off" data-d="0.5">+</button></span></div><div class="lyr">${LY.data.synced.map((l, i) => `<p data-ly="${i}">${esc(l.x || '♪')}</p>`).join('')}</div>`;
-    return `<div class="lyr-h"><span>Lirik · lrclib</span></div><div class="lyr plain">${LY.data.plain.split('\n').map((l) => `<p>${esc(l) || '&nbsp;'}</p>`).join('')}</div>`;
+    const src = esc(LY.data.source || 'lrclib') + (LY.tr ? ' · terjemahan Indonesia' : '');
+    const note = LY.data.gen ? '<div class="ly-note">Dibuat otomatis dari suara lagu — bisa ada kata yang kurang tepat.</div>' : '';
+    if (LY.data.synced) return `<div class="lyr-h"><span>Lirik sinkron · ${src}</span><span class="off">Sinkron <button data-act="ly-off" data-d="-0.5">−</button><b class="lyo">${lyOff > 0 ? '+' : ''}${lyOff}s</b><button data-act="ly-off" data-d="0.5">+</button></span></div>${note}<div class="lyr">${LY.data.synced.map((l, i) => `<p data-ly="${i}">${esc(l.x || '♪')}${lyTr(i)}</p>`).join('')}</div>`;
+    return `<div class="lyr-h"><span>Lirik · ${src}</span></div>${note}<div class="lyr plain">${LY.data.plain.split('\n').map((l, i) => `<p>${esc(l) || '&nbsp;'}${lyTr(i)}</p>`).join('')}</div>`;
   }
   function renderLyricsHead() { $$('.lyo').forEach((b) => { b.textContent = (lyOff > 0 ? '+' : '') + lyOff + 's'; }); lyLast = -2; }
   document.addEventListener('click', (e) => {
