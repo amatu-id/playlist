@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EQ Live</title>
+<style>
+  :root { color-scheme: dark; --bg: #0d0f14; --card: #171a22; --line: #262a35; --tx: #eef0f5; --mut: #9aa1b2; --ac: #1ed760; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--tx); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { padding: 18px; display: grid; gap: 14px; }
+  h1 { font-size: 17px; margin: 0; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #555; }
+  .live .dot { background: var(--ac); box-shadow: 0 0 10px var(--ac); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+  ol { margin: 6px 0 0; padding-left: 20px; color: var(--mut); }
+  ol b { color: var(--tx); }
+  button { font: inherit; border: 0; border-radius: 999px; padding: 11px 18px; font-weight: 700; cursor: pointer; background: var(--ac); color: #04130a; width: 100%; }
+  button.sec { background: #2a2f3b; color: var(--tx); }
+  canvas { width: 100%; height: 90px; display: block; border-radius: 10px; background: #0a0c10; }
+  #msg { color: var(--mut); min-height: 20px; }
+  #msg.err { color: #ff7a7a; }
+</style>
+<script src="js/fx.js"></script>
+</head>
+<body>
+<main id="root">
+  <h1><span class="dot"></span> EQ Live</h1>
+  <div class="card">
+    EQ Live memproses suara tab Amatu Playlist (YouTube, Spotify, radio) lewat equalizer secara langsung.
+    <ol>
+      <li>Klik <b>Mulai EQ Live</b>.</li>
+      <li>Pilih tab <b>Amatu Playlist</b> di daftar tab Chrome.</li>
+      <li>Aktifkan <b>Bagikan juga audio tab</b>, lalu klik <b>Bagikan</b>.</li>
+    </ol>
+  </div>
+  <button id="go">Mulai EQ Live</button>
+  <canvas id="viz" width="760" height="180"></canvas>
+  <div id="msg"></div>
+  <div class="card" style="color:var(--mut)">Biarkan jendela ini tetap terbuka (boleh diperkecil). Atur EQ dari aplikasi — perubahan langsung terdengar. Tutup jendela ini untuk mematikan EQ Live.</div>
+</main>
+<script>
+(function () {
+  const bc = new BroadcastChannel('amatu-eq');
+  const $ = (id) => document.getElementById(id);
+  let fx = null, C = null, stream = null;
+  const eqNow = () => { try { return JSON.parse(localStorage.getItem('amatu.playlist') || '{}').eq; } catch (e) { return null; } };
+  const say = (t, err) => { $('msg').textContent = t; $('msg').className = err ? 'err' : ''; };
+
+  function stop() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null; fx = null;
+    if (C) C.close(); C = null;
+    document.body.classList.remove('live');
+    $('go').textContent = 'Mulai EQ Live'; $('go').className = '';
+    bc.postMessage({ live: false });
+  }
+
+  async function start() {
+    if (fx) { stop(); say('EQ Live dimatikan.'); return; }
+    say('Menunggu pilihan tab…');
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: { suppressLocalAudioPlayback: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        selfBrowserSurface: 'exclude', systemAudio: 'exclude',
+      });
+      // only the audio matters — keep the video track alive but nearly idle
+      stream.getVideoTracks().forEach((t) => t.applyConstraints({ frameRate: 1, width: 320 }).catch(() => {}));
+    } catch (e) { say(e.name === 'NotAllowedError' ? 'Dibatalkan.' : 'Gagal: ' + e.message, true); return; }
+    const at = stream.getAudioTracks()[0];
+    if (!at) { stop(); say('Audio tab tidak ikut dibagikan. Ulangi dan aktifkan "Bagikan juga audio tab".', true); return; }
+    C = new AudioContext({ latencyHint: 'interactive' });
+    fx = FX.make(C);
+    fx.apply(eqNow());
+    C.createMediaStreamSource(new MediaStream([at])).connect(fx.input);
+    at.addEventListener('ended', () => { stop(); say('Berbagi tab dihentikan.'); });
+    stream.getVideoTracks().forEach((t) => t.addEventListener('ended', () => { stop(); say('Berbagi tab dihentikan.'); }));
+    document.body.classList.add('live');
+    $('go').textContent = 'Matikan EQ Live'; $('go').className = 'sec';
+    say('EQ Live aktif.');
+    bc.postMessage({ live: true });
+  }
+
+  bc.onmessage = (e) => {
+    const d = e.data || {};
+    if (d.eq && fx) fx.apply(d.eq);
+    if (d.ping) bc.postMessage({ live: !!fx });
+    if (d.stop) stop();
+  };
+  window.addEventListener('storage', (e) => { if (e.key === 'amatu.playlist' && fx) fx.apply(eqNow()); });
+  window.addEventListener('pagehide', () => bc.postMessage({ live: false }));
+  $('go').onclick = start;
+  window.EQLIVE = { spectrum: () => (fx ? fx.spectrum() : null), live: () => !!fx, bands: () => (fx ? fx.n.b.map((b) => +b.gain.value.toFixed(1)) : null), start, stop };
+
+  const cv = $('viz'), g = cv.getContext('2d');
+  (function draw() {
+    requestAnimationFrame(draw);
+    g.clearRect(0, 0, cv.width, cv.height);
+    if (!fx) return;
+    const s = fx.spectrum(), N = 64, w = cv.width / N;
+    for (let i = 0; i < N; i++) {
+      const k = Math.floor(Math.pow(i / N, 2) * s.length * 0.7);
+      const v = s[k] / 255, h = v * cv.height;
+      g.fillStyle = `hsl(${140 - v * 90},80%,${45 + v * 15}%)`;
+      g.fillRect(i * w + 1, cv.height - h, w - 2, h);
+    }
+  })();
+})();
+</script>
+</body>
+</html>
