@@ -54,7 +54,7 @@ window.Engine = (function () {
     a.addEventListener('loadedmetadata', () => { if (cur === 'au' && au.a === a) emit('meta'); });
   }
   au.el.addEventListener('error', () => {
-    if (cur !== 'au' || au.a !== au.el || !au.el.getAttribute('src')) return;
+    if (cur !== 'au' || au.a !== au.el || !au.el.getAttribute('src') || au.el.src.startsWith('data:')) return;
     // CORS refused (common for radio) → play untouched without FX
     if (au.live || au.src.startsWith('http')) {
       au.a = au.raw; au.raw.src = au.src; applyVol(); applyRate();
@@ -71,6 +71,20 @@ window.Engine = (function () {
     au.fx = FX.make(C);
     C.createMediaElementSource(au.el).connect(au.fx.input);
     au.fx.apply(fxBypass ? Object.assign({}, eqState, { on: false }) : eqState);
+  }
+
+  // A user gesture (tap/click/key) unlocks the Hi-Fi element + AudioContext once, so a track whose stream URL
+  // arrives seconds later (ad-free relay) still starts by itself — Safari/iOS otherwise blocks that play().
+  let unlocked = false;
+  const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+  function unlock() {
+    try { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); } catch (e) { /* no Web Audio */ }
+    if (unlocked || cur === 'au' || au.el.getAttribute('src')) return;
+    unlocked = true;
+    au.el.src = SILENT;
+    const p = au.el.play();
+    const done = () => { if (au.el.src === SILENT) { au.el.pause(); au.el.removeAttribute('src'); au.el.load(); } };
+    if (p && p.then) p.then(done, () => { unlocked = false; done(); }); else done();
   }
 
   // ---------- Spotify embed
@@ -210,7 +224,7 @@ window.Engine = (function () {
   }
 
   return {
-    on, load, play, pause, playing, time, duration, buffered, seek, fade,
+    on, load, play, pause, unlock, ytInit, playing, time, duration, buffered, seek, fade,
     toggle() { playing() ? pause() : play(); },
     get eng() { return cur; },
     setVol(v) { vol = v; applyVol(); },

@@ -494,3 +494,10 @@ body.dragging .dropzone { border-color: var(--ac); color: var(--tx); }
   .range .knob { opacity: 1; }
   .tr .like, .tr .mo { opacity: 1; }
 }
+
+/* live chart shelves */
+.card.sk .cv { background: linear-gradient(90deg, rgba(255,255,255,.05), rgba(255,255,255,.1), rgba(255,255,255,.05)); background-size: 200% 100%; animation: skl 1.4s linear infinite; }
+.card.sk .t, .card.sk .s { background: rgba(255,255,255,.06); border-radius: 4px; margin-top: 6px; width: 80%; }
+.card.sk .s { width: 55%; }
+@keyframes skl { to { background-position: -200% 0; } }
+.card .t .rk { color: var(--ac); margin-right: 6px; font-variant-numeric: tabular-nums; }

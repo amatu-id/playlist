@@ -15,9 +15,9 @@
   // ---------------------------------------------------------------- state
   const KEY = 'amatu.playlist', QKEY = 'amatu.playlist.q';
   const DEF = {
-    v: 1, likes: [], lists: [], saved: [], hist: [], plays: {}, recentCtx: [], recent: [], match: {}, alt: {},
+    v: 1, likes: [], lists: [], saved: [], hist: [], plays: {}, recentCtx: [], recent: [], match: {}, alt: {}, noAf: {},
     eq: JSON.parse(JSON.stringify(FX.DEF)), myPresets: {},
-    set: { spMode: 'yt', fade: 2, autoRadio: true, video: true, panel: true, ptab: 'np' },
+    set: { spMode: 'yt', fade: 2, autoRadio: true, video: true, panel: true, ptab: 'np', adFree: true },
     vol: 0.8, muted: false, rate: 1, shuffle: false, repeat: 0, listenSec: 0,
   };
   function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) || d; } catch (e) { return d; } }
@@ -162,9 +162,74 @@
   let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0;
   const tried = new Set();
 
+  // ---------------------------------------------------------------- ad-free audio (MacBook relay)
+  // The Downloader relay on the MacBook streams the song's audio straight from YouTube (yt-dlp) → no ads, and it
+  // plays in the Hi-Fi engine so the EQ works too. Offline relay / failure → regular YouTube player.
+  const AMT = window.AMATU;
+  const R = { url: new URLSearchParams(location.search).get('relay') || null, ok: false, wait: null, at: 0 };
+  const rtoken = () => (AMT && AMT.sess() && AMT.sess().t) || '';
+  async function rHello(u) {
+    const r = await fetch(u + '/api/hello', { cache: 'no-store', signal: AbortSignal.timeout(6000) });
+    const j = await r.json();
+    if (!r.ok || !j.audio) throw new Error('relay lama');
+    return u;
+  }
+  function relay(force) {
+    if (R.wait) return R.wait;
+    if (!force && Date.now() - R.at < (R.ok ? 300e3 : 30e3)) return Promise.resolve(R.ok);
+    R.wait = (async () => {
+      const cands = [];
+      if (R.url) cands.push(R.url);
+      const c = AMT && AMT.jget('pt.dl.relay', null);
+      if (c && c.url && !cands.includes(c.url)) cands.push(c.url);
+      let u = null;
+      for (const x of cands) { try { u = await rHello(x); break; } catch (e) { /* next */ } }
+      if (!u && AMT && rtoken()) {
+        const d = await AMT.rpc('amt_relay_get', { p_token: rtoken(), p_name: 'downloader' }).catch(() => null);
+        if (d && d.url && !cands.includes(d.url)) { try { u = await rHello(d.url); AMT.jset('pt.dl.relay', { url: d.url, t: d.t }); } catch (e) { /* offline */ } }
+      }
+      R.ok = !!u; if (u) R.url = u; R.at = Date.now(); R.wait = null;
+      return R.ok;
+    })();
+    return R.wait;
+  }
+  const AF = new Map();   // video id → promise of stream URL (also used to prefetch the next songs)
+  function adFreeUrl(id) {
+    const c = AF.get(id);
+    if (c && Date.now() - c.t < 3 * 3600e3) return c.p;
+    const p = (async () => {
+      if (!(await relay())) return null;
+      const r = await fetch(R.url + '/api/play?id=' + encodeURIComponent(id), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(25000) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.u) throw new Error(j.error || 'relay ' + r.status);
+      return R.url + j.u;
+    })().catch((e) => { AF.delete(id); if (!/relay \d|tidak|Audio/.test(e.message)) { R.ok = false; R.at = 0; } return null; });
+    AF.set(id, { p, t: Date.now() });
+    if (AF.size > 200) AF.delete(AF.keys().next().value);
+    return p;
+  }
+  const afBlocked = (id) => Date.now() - (S.noAf[id] || 0) < 864e5;   // failed recently → YouTube player for a day
+  const adFreeOn = () => S.set.adFree && (!!AMT || !!R.url);   // ?relay=… = local test relay
+  const wantsVideo = (t) => vidOverride.k === key(t) && vidOverride.v === true;
+  async function ytSpec(t, id) {
+    if (adFreeOn() && !wantsVideo(t) && !afBlocked(id)) {
+      const url = await adFreeUrl(id);
+      if (url) return { eng: 'au', url, ar: id };
+    }
+    return { eng: 'yt', id };
+  }
+  // warm the relay for the next songs so they start instantly
+  function prefetchNext(withCur) {
+    if (!adFreeOn() || !R.ok) return;
+    for (const t of Q.list.slice(Q.i + (withCur ? 0 : 1), Q.i + 3)) {
+      const id = t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null;
+      if (id && !afBlocked(id)) adFreeUrl(id);
+    }
+  }
+
   const MTHUMB = {};
   async function specFor(t) {
-    if (t.src === 'yt') return { eng: 'yt', id: S.alt[t.id] || t.id };
+    if (t.src === 'yt') return ytSpec(t, S.alt[t.id] || t.id);
     if (t.src === 'sp') {
       const m = S.set.spMode;
       if (m === 'embed') return { eng: 'sp', uri: 'spotify:track:' + t.id };
@@ -175,7 +240,7 @@
         if (m2) { id = m2.id; MTHUMB[id] = m2.thumb; S.match[t.id] = id; const ks = Object.keys(S.match); if (ks.length > 600) delete S.match[ks[0]]; save(); }
       }
       if (id && !t.ownThumb) { t.ownThumb = true; t.thumb = MTHUMB[id] || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`; }
-      if (id) return { eng: 'yt', id: S.alt[id] || id };
+      if (id) return ytSpec(t, S.alt[id] || id);
       if (t.preview) return { eng: 'au', url: t.preview };
       return { eng: 'sp', uri: 'spotify:track:' + t.id };
     }
@@ -207,6 +272,7 @@
     if (opt.autoplay !== false) addHist(t);
     renderNow();
     loadLyrics(t);
+    setTimeout(() => { if (tok === playTok) prefetchNext(); }, 2500);
   }
 
   function setQueue(tracks, i, ctx, opt) {
@@ -309,6 +375,14 @@
     const t = cur();
     if (!t) return;
     const tok = playTok;
+    if (err.eng === 'au' && curSpec && curSpec.ar) {
+      const id = curSpec.ar, at = Engine.time();
+      AF.delete(id); S.noAf[id] = Date.now(); const ks = Object.keys(S.noAf); if (ks.length > 300) delete S.noAf[ks[0]]; save();
+      toast('Mode bebas iklan gagal untuk lagu ini — diputar lewat YouTube', 'err');
+      curSpec = { eng: 'yt', id }; tried.add(id);
+      Engine.load(curSpec, { autoplay: true, start: at > 2 ? at : 0 });
+      return;
+    }
     if (err.eng === 'yt' && altTries < 3) {
       altTries++;
       const q = `${t.title} ${artistsText(t)}`;
@@ -508,6 +582,25 @@
       <div class="cv"${bg(c.thumb)}>${c.tag ? `<span class="tag ${c.tag}">${icon(c.tag)}${c.tag === 'sp' ? 'Spotify' : 'YouTube'}</span>` : ''}${c.ref ? `<button class="pb" data-act="pc" title="Putar">${icon(playing ? 'pause' : 'play')}</button>` : ''}</div>
       <div class="t">${esc(c.title)}</div><div class="s">${esc(c.sub || '')}</div></div>`;
   }
+  const LIVE = [
+    ['sp:37i9dQZEVXbObFQZ3JLcXt', 'Lagu terpopuler di Indonesia hari ini', '#sp/37i9dQZEVXbObFQZ3JLcXt'],
+    ['yt:VLOLAK5uy_n7Ig_LAUbKE6_ZeQ1pwHmJcEhwX7BekBo', 'Lagi trending di YouTube Indonesia', '#playlist/VLOLAK5uy_n7Ig_LAUbKE6_ZeQ1pwHmJcEhwX7BekBo'],
+    ['yt:VLPL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i', 'Lagu terpopuler dunia minggu ini', '#playlist/VLPL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i'],
+    ['sp:37i9dQZF1DXcBWIGoYBM5M', "Today's Top Hits", '#sp/37i9dQZF1DXcBWIGoYBM5M'],
+  ];
+  function fillLive() {
+    LIVE.forEach(([ref], i) => {
+      const sec = $(`[data-live="${i}"]`);
+      if (!sec) return;
+      collTracks(ref).then((c) => {
+        const row = sec.isConnected && $('.row', sec);
+        if (!row) return;
+        if (!c.tracks.length) { sec.remove(); return; }
+        row.innerHTML = songCards(c.tracks.slice(0, 24), { name: c.name, href: c.href, ref, thumb: c.thumb });
+        $$('.card', row).forEach((el, j) => { const t = $('.t', el); if (t) t.insertAdjacentHTML('afterbegin', `<b class="rk">${j + 1}</b>`); });
+      }).catch(() => sec.remove());
+    });
+  }
   const songCards = (tracks, ctx) => { const lid = regList(tracks, ctx); return tracks.map((t, i) => `<div class="card" data-l="${lid}" data-i="${i}"><div class="cv"${bg(t.thumb)}><button class="pb" data-act="ps">${icon('play')}</button></div><div class="t">${esc(t.title)}</div><div class="s">${esc(artistsText(t))}</div></div>`).join(''); };
   const TR = { 'Songs': 'Lagu', 'Videos': 'Video', 'Albums': 'Album', 'Artists': 'Artis', 'Playlists': 'Playlist', 'Community playlists': 'Playlist komunitas', 'Featured playlists': 'Playlist pilihan', 'Top songs': 'Lagu populer', 'Singles & EPs': 'Single & EP', 'Singles': 'Single', 'Live performances': 'Penampilan live', 'Featured on': 'Ditampilkan di', 'Fans might also like': 'Penggemar juga menyukai', 'Releases for you': 'Rilisan untukmu', 'Other versions': 'Versi lain', 'More from': 'Lainnya dari', 'Episodes': 'Episode' };
   const tr = (t) => TR[t] || String(t || '').replace(/^Playlists by /, 'Playlist oleh ').replace(/^More from /, 'Lainnya dari ');
@@ -573,6 +666,9 @@
       const seeds = [];
       for (const x of S.hist) { const a = artistsText(x.t); if (x.t.src === 'yt' && !seeds.some((s) => artistsText(s) === a)) seeds.push(x.t); if (seeds.length >= 6) break; }
       if (seeds.length) h += shelf('Mix untukmu', seeds.map((t) => card({ href: '', ref: 'mix:' + t.id, title: 'Mix ' + ((t.artists[0] || {}).name || t.title), sub: 'Lagu mirip ' + t.title + ' & lainnya', thumb: t.thumb })).join(''));
+      // live chart songs (refreshed by YouTube/Spotify daily/weekly), one tap to play
+      h += LIVE.map(([ref, title, href], i) => `<section class="shelf" data-live="${i}"><div class="shelf-h"><h2>${esc(title)}</h2><a href="${href}">Lihat semua</a></div><div class="row">${'<div class="card sk"><div class="cv"></div><div class="t">&nbsp;</div><div class="s">&nbsp;</div></div>'.repeat(8)}</div></section>`).join('');
+      setTimeout(fillLive, 0);
       for (const s of window.HOME || []) h += shelf(s.title, s.items.map((it) => card(cardFor(it))).join(''));
       h += `<section class="shelf"><div class="shelf-h"><h2>Jelajahi genre</h2></div><div class="genres">${GENRES.slice(0, 12).map(([g, c]) => `<div class="genre" style="background:${c}" data-genre="${esc(g)}">${esc(g)}</div>`).join('')}</div></section>`;
       return h;
@@ -1035,6 +1131,7 @@
     if (!t) return ['', ''];
     if (t.src === 'radio') return ['hf', 'RADIO'];
     if (t.src === 'file') return ['hf', 'HI-FI'];
+    if (e === 'au' && curSpec && curSpec.ar) return ['hf', 'BEBAS IKLAN · HI-FI'];
     if (e === 'au') return ['hf', 'HI-FI · PREVIEW'];
     if (e === 'sp') return ['sp', 'SPOTIFY'];
     if (t.src === 'sp') return ['yt', 'SPOTIFY → YT'];
@@ -1063,7 +1160,7 @@
     const vid = isVideoMode();
     $('#fStage').classList.toggle('vid', vid);
     $('#fVid').classList.toggle('on', vid);
-    $('#fVid').style.display = Engine.eng === 'yt' ? '' : 'none';
+    $('#fVid').style.display = Engine.eng === 'yt' || (curSpec && curSpec.ar) ? '' : 'none';
     if (t && t.thumb !== lastTintFor) { lastTintFor = t.thumb; tintOf(t.thumb).then((c) => document.documentElement.style.setProperty('--tint', c)); }
     mediaMeta(t);
     renderPanel();
@@ -1076,9 +1173,19 @@
     const t = cur();
     if (Engine.eng !== 'yt' || !t) return false;
     if (vidOverride.k === key(t) && vidOverride.v != null) return vidOverride.v;
-    return S.set.video && t.kind === 'video';
+    return S.set.video && t.kind === 'video' && !(adFreeOn() && curSpec && curSpec.id && !afBlocked(curSpec.id) && R.ok);
   };
-  function toggleVideo() { vidOverride = { k: curKey(), v: !isVideoMode() }; dockHidden = false; renderNow(); }
+  function toggleVideo() {
+    const v = !isVideoMode();
+    vidOverride = { k: curKey(), v }; dockHidden = false;
+    // ad-free audio has no picture: the video needs the YouTube player (and back to ad-free when turned off)
+    if (v && Engine.eng === 'au' && curSpec && curSpec.ar) { curSpec = { eng: 'yt', id: curSpec.ar }; Engine.load(curSpec, { autoplay: Engine.playing(), start: Engine.time() }); }
+    else if (!v && Engine.eng === 'yt' && adFreeOn() && curSpec && curSpec.id && !afBlocked(curSpec.id)) {
+      const id = curSpec.id, at = Engine.time(), was = Engine.playing(), tok = playTok;
+      adFreeUrl(id).then((url) => { if (url && tok === playTok && !isVideoMode()) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: was, start: at }); } });
+    }
+    renderNow();
+  }
 
   // panel
   const pbody = $('#pbody');
@@ -1413,6 +1520,7 @@
     const seg = (k, opts) => `<div class="seg" data-seg="${k}">${opts.map(([v, l]) => `<button type="button" data-v="${v}" class="${String(S.set[k]) === String(v) ? 'on' : ''}">${l}</button>`).join('')}</div>`;
     const sw = (k) => `<button type="button" class="sw${S.set[k] ? ' on' : ''}" data-sw="${k}"></button>`;
     openModal(`<h3>Pengaturan <button class="ib" data-close>${icon('x')}</button></h3>
+      <div class="set-row"><div class="l"><b>Bebas iklan</b><span>Lagu YouTube diputar sebagai audio Hi-Fi lewat server MacBook (tanpa iklan, EQ aktif). <i id="afSt">Memeriksa server…</i></span></div>${sw('adFree')}</div>
       <div class="set-row"><div class="l"><b>Lagu dari Spotify diputar via</b><span>Lagu penuh lewat YouTube, Spotify embed (lagu penuh bila login Spotify di browser), atau preview 30 dtk Hi-Fi dengan EQ.</span></div>${seg('spMode', [['yt', 'YouTube'], ['embed', 'Spotify'], ['preview', 'Preview']])}</div>
       <div class="set-row"><div class="l"><b>Transisi halus</b><span>Fade-in/out antar lagu (detik)</span></div>${seg('fade', [[0, 'Mati'], [2, '2'], [4, '4'], [6, '6'], [10, '10']])}</div>
       <div class="set-row"><div class="l"><b>Autoplay lagu serupa</b><span>Saat antrean habis, lanjut otomatis dengan lagu mirip</span></div>${sw('autoRadio')}</div>
@@ -1423,12 +1531,21 @@
         const sb = e.target.closest('[data-seg] [data-v]');
         if (sb) { const k = sb.parentNode.dataset.seg; const v = sb.dataset.v; S.set[k] = isNaN(+v) ? v : +v; $$('button', sb.parentNode).forEach((b) => b.classList.toggle('on', b === sb)); save(); if (k === 'spMode' && route.name === 'sp') render(); }
         const w = e.target.closest('[data-sw]');
-        if (w) { const k = w.dataset.sw; S.set[k] = !S.set[k]; w.classList.toggle('on', S.set[k]); save(); if (k === 'video') renderNow(); }
+        if (w) { const k = w.dataset.sw; S.set[k] = !S.set[k]; w.classList.toggle('on', S.set[k]); save(); if (k === 'video') renderNow(); if (k === 'adFree') { S.noAf = {}; afStatus(c); } }
       };
+      afStatus(c);
       $('#sExp', c).onclick = exportAll;
       $('#sImp', c).onclick = () => $('#impIn').click();
       $('#sClr', c).onclick = () => { S.hist = []; S.plays = {}; S.listenSec = 0; S.recentCtx = []; save(); toast('Riwayat & statistik dihapus'); render(); };
     });
+  }
+
+  function afStatus(c) {
+    const el = $('#afSt', c);
+    if (!el) return;
+    if (!AMT && !R.url) { el.textContent = 'Perlu masuk Portal AMATU.'; return; }
+    el.textContent = 'Memeriksa server…';
+    relay(true).then((ok) => { el.textContent = ok ? '✓ Server MacBook aktif.' : '✕ Server MacBook offline — sementara lewat YouTube (bisa ada iklan).'; el.style.color = ok ? 'var(--ac)' : '#e5484d'; });
   }
 
   // ---------------------------------------------------------------- media session + PiP
@@ -1607,6 +1724,23 @@
   if (location.hash.startsWith('#t=')) openShared(); else render();
   if (Q.list.length) { Q.i = Math.min(Q.i, Q.list.length - 1); renderNow(); }
   else renderPanel();
+  // the first tap/click/key unlocks audio, so songs start by themselves even when their stream arrives later
+  for (const ev of ['pointerdown', 'keydown', 'touchend']) document.addEventListener(ev, () => Engine.unlock(), { capture: true, passive: true });
+  if (adFreeOn()) relay().then((ok) => { if (ok && Q.list.length) prefetchNext(true); });
+  // hovering (or pressing) a song warms its ad-free stream, so the click starts it sooner
+  let hoverT = 0;
+  const warm = (e) => {
+    const el = e.target.closest && e.target.closest('.tr[data-i], [data-l][data-i]');
+    if (!el || !adFreeOn() || !R.ok) return;
+    const L = LISTS.get((el.closest('[data-l]') || {}).dataset ? el.closest('[data-l]').dataset.l : '');
+    const t = L && L.tracks[+el.dataset.i];
+    const id = t && (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
+    if (id && !afBlocked(id)) adFreeUrl(id);
+  };
+  document.addEventListener('pointerover', (e) => { clearTimeout(hoverT); if (!touch && e.target.closest && e.target.closest('.pi, .pb')) hoverT = setTimeout(() => warm(e), 300); }, { passive: true });
+  document.addEventListener('pointerdown', warm, { passive: true, capture: true });
+  Engine.ytInit().catch(() => { /* loads again on first YouTube song */ });
+  setInterval(() => { if (adFreeOn() && !R.ok && document.visibilityState === 'visible') relay(); }, 60e3);
   window.addEventListener('resize', debounce(() => { dockKey = ''; }, 100));
   window.addEventListener('pagehide', () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* ignore */ } });
   window.addEventListener('storage', (e) => {
