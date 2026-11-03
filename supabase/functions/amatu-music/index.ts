@@ -3,6 +3,7 @@
 //     ?a=browse&id=MPREb_..|VL..|UC..|FEmusic_home
 //     ?a=radio&v=<videoId>      ?a=suggest&q=..
 //     ?a=lyrics&id=<videoId>    (YouTube Music lyrics, timed when the Android client has them)
+//     ?a=lrc&t=<title>&ar=<artist>&d=<seconds>   (NetEase synced lyrics)
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-client-info',
@@ -256,6 +257,29 @@ async function handle(u: URL) {
     };
     walk2(await yt('browse', { browseId: m[1] }), 0);
     return { lyrics: plain ? { plain, synced: null, source: src(foot) } : null };
+  }
+  if (a === 'lrc') {
+    // NetEase Cloud Music: synced lyrics for songs lrclib and YouTube Music don't know (also many Indonesian ones)
+    const title = u.searchParams.get('t') || '', artist = u.searchParams.get('ar') || '', sec = +(u.searchParams.get('d') || 0);
+    const norm = (x: string) => x.toLowerCase().replace(/\(.*?\)|\[.*?\]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    const ne = async (path: string) => {
+      const r = await fetch('https://music.163.com/api/' + path, { headers: { Referer: 'https://music.163.com/', 'User-Agent': 'Mozilla/5.0 (Macintosh) Chrome/130.0 Safari/537.36' } });
+      if (!r.ok) throw new Error('netease ' + r.status);
+      return await r.json();
+    };
+    const d = await ne('search/get?' + new URLSearchParams({ s: `${title} ${artist}`, type: '1', limit: '10' }));
+    const nt = norm(title), na = norm(artist);
+    for (const x of d.result?.songs || []) {
+      if (norm(x.name) !== nt) continue;
+      // same title is not enough: the artist or the exact length has to agree
+      const ar = norm((x.artists || []).map((y: J) => y.name).join(' '));
+      if (!(na && ar && (ar.includes(na) || na.includes(ar))) && !(sec && Math.abs(x.duration / 1000 - sec) <= 3)) continue;
+      const l = await ne('song/lyric?' + new URLSearchParams({ id: String(x.id), lv: '1' }));
+      const lines = String(l.lrc?.lyric || '').split('\n')
+        .filter((y) => !/\]\s*[^\]]*[\u4e00-\u9fff][^\]]*[:：]/.test(y) && !/\]\s*(lyricist|composer|arranger|producer)\s*[:：]/i.test(y));
+      if (lines.filter((y) => /\]\s*\S/.test(y)).length >= 4 && !/纯音乐/.test(lines.join(''))) return { lrc: lines.join('\n') };
+    }
+    return { lrc: null };
   }
   if (a === 'suggest') {
     const d = await yt('music/get_search_suggestions', { input: (u.searchParams.get('q') || '').slice(0, 100) });

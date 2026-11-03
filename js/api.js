@@ -51,7 +51,7 @@ window.API = (function () {
     return { id: best.id, thumb: best.thumb };
   }
 
-  // Lyrics, first source that has them: lrclib.net (often synced) → YouTube Music (Musixmatch / LyricFind).
+  // Lyrics, first source that has them: lrclib.net (often synced) → YouTube Music (Musixmatch / LyricFind) → NetEase.
   // Video titles like "Song - Artist | Lirik Lagu (Official Video)" are cleaned into title + artist first.
   const lnorm = (s) => (s || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/\(.*?\)|\[.*?\]|feat\..*$|ft\..*$/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
   function lyricQuery(t) {
@@ -74,12 +74,17 @@ window.API = (function () {
     return q;
   }
   // lrclib sometimes stops answering: every call has a timeout and a dead lrclib is skipped for a while
-  let lrcDown = 0;
+  let lrcDown = 0, lrcBad = 0;
   async function lrc(path) {
-    if (Date.now() - lrcDown < 120e3) return null;
-    try { const r = await fetch('https://lrclib.net/api/' + path, { signal: AbortSignal.timeout(7000) }); return r.ok ? await r.json() : null; }
-    catch (e) { if (e.name === 'TimeoutError' || e.name === 'TypeError') lrcDown = Date.now(); return null; }
+    if (Date.now() - lrcDown < 120e3) { lrcBad = Date.now(); return null; }
+    try {
+      const r = await fetch('https://lrclib.net/api/' + path, { signal: AbortSignal.timeout(7000) });
+      if (!r.ok && r.status !== 404) lrcBad = Date.now();
+      return r.ok ? await r.json() : null;
+    } catch (e) { lrcBad = Date.now(); if (e.name === 'TimeoutError' || e.name === 'TypeError') lrcDown = Date.now(); return null; }
   }
+  // a miss while lrclib is failing says nothing about the song: worth asking again
+  const lyricsUnsure = () => Date.now() - lrcBad < 60e3;
   async function lrclib(t) {
     for (const q of lyricQuery(t).alts) {
       const x = await lrclibOne(t, q.title, q.artist);
@@ -114,10 +119,17 @@ window.API = (function () {
     const l = d.lyrics;
     return l && (l.plain || '').trim() ? { synced: l.synced && l.synced.length ? l.synced : null, plain: l.plain, source: l.source || 'YouTube Music' } : null;
   }
+  async function neLyrics(t) {
+    const q = lyricQuery(t);
+    const d = await edge({ a: 'lrc', t: q.title, ar: q.artist, d: t.sec || 0 });
+    const synced = parseLrc(d.lrc);
+    return synced ? { synced, plain: synced.map((l) => l.x).join('\n'), source: 'NetEase' } : null;
+  }
   async function lyrics(t, ytId) {
     const a = await lrclib(t).catch(() => null);
     if (a) return a;
-    return ytId ? ytLyrics(ytId).catch(() => null) : null;
+    const b = ytId ? await ytLyrics(ytId).catch(() => null) : null;
+    return b || neLyrics(t).catch(() => null);
   }
 
   // Indonesian translation per line (Google's Chrome translate endpoint — CORS-open, detects each line's language)
@@ -168,5 +180,5 @@ window.API = (function () {
     return [];
   }
 
-  return { EDGE, edge, track, tracksOf, search, browse, radio, suggest, spotify, match, lyrics, lyricQuery, translate, stations };
+  return { EDGE, edge, track, tracksOf, search, browse, radio, suggest, spotify, match, lyrics, lyricsUnsure, lyricQuery, translate, stations };
 })();
