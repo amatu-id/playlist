@@ -162,11 +162,12 @@
   let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0;
   const tried = new Set();
 
-  // ---------------------------------------------------------------- ad-free audio (MacBook relay)
+  // ---------------------------------------------------------------- ad-free audio (MacBook relay → cloud)
   // The Downloader relay on the MacBook streams the song's audio straight from YouTube (yt-dlp) → no ads, and it
-  // plays in the Hi-Fi engine so the EQ works too. While "Bebas iklan" is on songs never fall back to the YouTube
-  // player (that is where the ads come from): a dropped tunnel is looked up again and the stream resumes at the same
-  // spot, a song the relay can't fetch tries another upload, and an offline relay is waited for.
+  // plays in the Hi-Fi engine so the EQ works too. With the MacBook off the same audio comes from a cloud server
+  // (public Invidious instances proxy YouTube's audio with CORS + Range). A dropped stream resumes at the same spot,
+  // a song neither can fetch tries another upload, and only when nothing ad-free works the YouTube player takes over
+  // so the music never stops.
   const AMT = window.AMATU;
   const R = { url: new URLSearchParams(location.search).get('relay') || null, ok: false, wait: null, at: 0 };
   const rtoken = () => (AMT && AMT.sess() && AMT.sess().t) || '';
@@ -209,39 +210,74 @@
       return j.u;
     })();
   }
+  // cloud: Invidious instances, the last one that worked first; the public list refreshes once a day
+  const INV = ['https://yt.chocolatemoo53.com'];
+  const C = { list: null, at: 0, ok: null };
+  async function invList() {
+    if (C.list && Date.now() - C.at < 864e5) return C.list;
+    let l = [];
+    try { const c = JSON.parse(localStorage.getItem('pt.pl.inv') || 'null'); if (c && Date.now() - c.t < 864e5) l = c.l; } catch (e) { /* ignore */ }
+    if (!l.length) {
+      try {
+        const r = await fetch('https://api.invidious.io/instances.json?sort_by=health', { signal: AbortSignal.timeout(6000) });
+        l = (await r.json()).filter(([, i]) => i && i.api && i.type === 'https' && i.uri).map(([, i]) => i.uri.replace(/\/$/, ''));
+        try { localStorage.setItem('pt.pl.inv', JSON.stringify({ t: Date.now(), l })); } catch (e) { /* ignore */ }
+      } catch (e) { /* list offline: built-ins only */ }
+    }
+    C.list = [...new Set([...INV, ...l])].slice(0, 8); C.at = Date.now();
+    return C.list;
+  }
+  async function cloudUrl(id) {
+    const l = await invList();
+    for (const h of C.ok ? [C.ok, ...l.filter((x) => x !== C.ok)] : l) {
+      try {
+        const r = await fetch(`${h}/api/v1/videos/${encodeURIComponent(id)}?local=true&fields=adaptiveFormats`, { signal: AbortSignal.timeout(9000) });
+        const fm = ((await r.json()).adaptiveFormats || []).filter((f) => /^audio\/mp4/.test(f.type || '') && f.url);
+        const f = fm.find((f) => String(f.itag) === '140') || fm.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+        if (f) { C.ok = h; return new URL(f.url, h).href; }
+      } catch (e) { /* next instance */ }
+    }
+    if (C.ok && l.length) C.ok = null;
+    throw new Error('cloud');
+  }
+  // relay first (yt-dlp, works for every upload), the cloud when the MacBook is off or can't fetch it
+  function afSource(id) {
+    return playPath(id).catch((e) => {
+      if (e.message !== 'offline' && /fetch|network|abort|timeout/i.test(e.message)) { R.ok = false; R.at = 0; }
+      return cloudUrl(id);
+    });
+  }
   function adFreeUrl(id, fresh) {
     let c = AF.get(id);
-    if (fresh || !c || Date.now() - c.t > 3 * 3600e3) {
-      c = { p: playPath(id), t: Date.now() };
+    if (fresh || !c || Date.now() - c.t > 2 * 3600e3) {
+      c = { p: afSource(id), t: Date.now() };
       AF.set(id, c);
       c.p.catch(() => { if (AF.get(id) === c) AF.delete(id); });
       if (AF.size > 200) AF.delete(AF.keys().next().value);
     }
-    return c.p.then((u) => R.url + u, (e) => { if (e.message !== 'offline' && /fetch|network|abort|timeout/i.test(e.message)) { R.ok = false; R.at = 0; } return null; });
+    return c.p.then((u) => (u[0] === '/' ? R.url + u : u), () => null);
   }
   const adFreeOn = () => S.set.adFree && (!!AMT || !!R.url);   // ?relay=… = local test relay
   const wantsVideo = (t) => vidOverride.k === key(t) && vidOverride.v === true;
   async function ytSpec(t, id) {
     if (!adFreeOn() || wantsVideo(t)) return { eng: 'yt', id };
-    let url = await adFreeUrl(id);
-    if (!url && !R.ok && (await relay(true))) url = await adFreeUrl(id, true);
-    return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id, off: !R.ok };
+    const url = await adFreeUrl(id);
+    return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id };
   }
-  // relay offline: stay silent (no YouTube ads) and start the song as soon as the MacBook answers again
-  let afWaitTok = 0;
-  function waitRelay(tok, at) {
-    if (afWaitTok === tok) return;
-    afWaitTok = tok;
-    Engine.stop(); $('#bar').classList.add('loading');
-    toast('Server bebas iklan (MacBook) belum tersambung — menunggu, tanpa iklan YouTube', 'err');
-    const tick = async () => {
-      if (tok !== playTok) return;
-      if (await relay(true)) { if (tok === playTok) { afWaitTok = 0; startCur({ start: at }); } return; }
-      setTimeout(tick, 5000);
-    };
-    setTimeout(tick, 3000);
+  // nothing ad-free answers: the YouTube player keeps the music going (it may show ads)
+  let ytFbAt = 0;
+  function ytFallback(t, tok, at) {
+    if (tok !== playTok) return;
+    const id = (curSpec && curSpec.ar) || [...tried][0] || (t.src === 'yt' ? t.id : S.match[t.id]);
+    if (!id) return next(true);
+    if (Date.now() - ytFbAt > 600e3) toast('Server bebas iklan tidak tersedia — memakai pemutar YouTube (bisa ada iklan)', 'err');
+    ytFbAt = Date.now();
+    curSpec = { eng: 'yt', id }; altTries = 3;
+    Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }).then(() => { if (tok === playTok) $('#bar').classList.remove('loading'); }, () => {});
+    renderNow();
+    if (!at) { addHist(t); loadLyrics(t); }
   }
-  // the relay can't fetch this upload → another upload of the same song, still through the relay
+  // no source can fetch this upload → another upload of the same song, still ad-free
   async function afAlt(t, tok) {
     while (altTries < 3) {
       altTries++;
@@ -257,17 +293,16 @@
         if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
         curSpec = { eng: 'au', url, ar: alt.id }; afFix = 0;
         Engine.load(curSpec, { autoplay: true });
-        renderNow();
+        renderNow(); addHist(t); loadLyrics(t);
         return;
       }
-      if (!R.ok) return waitRelay(tok, 0);
+      if (altTries === 1 && !R.ok && !C.ok) break;   // MacBook off and the cloud is down: other uploads won't help
     }
-    toast('Tidak dapat memutar "' + t.title + '" tanpa iklan — lanjut', 'err');
-    setTimeout(() => { if (tok === playTok) next(true); }, 1200);
+    ytFallback(t, tok, 0);
   }
   // warm the relay for the next songs so they start instantly
   function prefetchNext(withCur) {
-    if (!adFreeOn() || !R.ok) return;
+    if (!adFreeOn() || (!R.ok && !C.ok)) return;
     for (const t of Q.list.slice(Q.i + (withCur ? 0 : 1), Q.i + 3)) {
       const id = t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null;
       if (id) adFreeUrl(id);
@@ -309,7 +344,6 @@
     if (!spec) { toast('Lagu tidak tersedia', 'err'); return next(true); }
     if (spec.eng === 'af') {
       curSpec = null; tried.add(spec.ar);
-      if (spec.off) return waitRelay(tok, opt.start || 0);
       Engine.stop(); return afAlt(t, tok);
     }
     curSpec = spec;
@@ -431,14 +465,14 @@
     if (!t) return;
     const tok = playTok;
     if (err.eng === 'au' && curSpec && curSpec.ar) {
-      // stream broke: usually the tunnel got a new address mid-song → same stream, same spot
+      // stream broke: the tunnel got a new address, the MacBook went off or a cloud link expired → same song, same spot
       const id = curSpec.ar, at = Engine.time();
       if (afFix++ < 3) {
-        if (!(await relay(true))) return tok === playTok && waitRelay(tok, at);
-        const url = await adFreeUrl(id, afFix > 1);
+        if (R.ok) await relay(true);
+        const url = await adFreeUrl(id, true);
         if (tok !== playTok) return;
         if (url) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }); return; }
-        if (!R.ok) return waitRelay(tok, at);
+        if (!R.ok && !C.ok) return ytFallback(t, tok, at);
       }
       tried.add(id);
       return afAlt(t, tok);
@@ -1192,7 +1226,7 @@
     if (t.src === 'radio') return ['hf', 'RADIO'];
     if (t.src === 'file') return ['hf', 'HI-FI'];
     if (e === 'au' && curSpec && curSpec.ar) return ['hf', 'BEBAS IKLAN · HI-FI'];
-    if (!e && adFreeOn() && (t.src === 'yt' || t.src === 'sp')) return ['hf', 'BEBAS IKLAN · MENUNGGU SERVER'];
+    if (!e && adFreeOn() && (t.src === 'yt' || t.src === 'sp')) return ['hf', 'BEBAS IKLAN · MEMUAT'];
     if (e === 'au') return ['hf', 'HI-FI · PREVIEW'];
     if (e === 'sp') return ['sp', 'SPOTIFY'];
     if (t.src === 'sp') return ['yt', 'SPOTIFY → YT'];
@@ -1655,7 +1689,7 @@
     const seg = (k, opts) => `<div class="seg" data-seg="${k}">${opts.map(([v, l]) => `<button type="button" data-v="${v}" class="${String(S.set[k]) === String(v) ? 'on' : ''}">${l}</button>`).join('')}</div>`;
     const sw = (k) => `<button type="button" class="sw${S.set[k] ? ' on' : ''}" data-sw="${k}"></button>`;
     openModal(`<h3>Pengaturan <button class="ib" data-close>${icon('x')}</button></h3>
-      <div class="set-row"><div class="l"><b>Bebas iklan</b><span>Lagu YouTube diputar sebagai audio Hi-Fi lewat server MacBook (tanpa iklan, EQ aktif). <i id="afSt">Memeriksa server…</i></span></div>${sw('adFree')}</div>
+      <div class="set-row"><div class="l"><b>Bebas iklan</b><span>Lagu YouTube diputar sebagai audio Hi-Fi tanpa iklan (EQ aktif) lewat server MacBook, atau server cloud saat MacBook mati. <i id="afSt">Memeriksa server…</i></span></div>${sw('adFree')}</div>
       <div class="set-row"><div class="l"><b>Lagu dari Spotify diputar via</b><span>Lagu penuh lewat YouTube, Spotify embed (lagu penuh bila login Spotify di browser), atau preview 30 dtk Hi-Fi dengan EQ.</span></div>${seg('spMode', [['yt', 'YouTube'], ['embed', 'Spotify'], ['preview', 'Preview']])}</div>
       <div class="set-row"><div class="l"><b>Transisi halus</b><span>Fade-in/out antar lagu (detik)</span></div>${seg('fade', [[0, 'Mati'], [2, '2'], [4, '4'], [6, '6'], [10, '10']])}</div>
       <div class="set-row"><div class="l"><b>Autoplay lagu serupa</b><span>Saat antrean habis, lanjut otomatis dengan lagu mirip</span></div>${sw('autoRadio')}</div>
@@ -1681,7 +1715,13 @@
     if (!el) return;
     if (!AMT && !R.url) { el.textContent = 'Perlu masuk Portal AMATU.'; return; }
     el.textContent = 'Memeriksa server…';
-    relay(true).then((ok) => { el.textContent = ok ? '✓ Server MacBook aktif.' : '✕ Server MacBook offline — lagu menunggu server (tidak memakai YouTube, jadi tanpa iklan).'; el.style.color = ok ? 'var(--ac)' : '#e5484d'; });
+    relay(true).then(async (ok) => {
+      if (ok) { el.textContent = '✓ Server MacBook aktif.'; el.style.color = 'var(--ac)'; return; }
+      el.textContent = 'MacBook offline — memeriksa server cloud…';
+      const c = await cloudUrl('dQw4w9WgXcQ').then(() => true, () => false);
+      el.textContent = c ? '✓ MacBook offline — memakai server cloud (tetap tanpa iklan).' : '✕ MacBook & server cloud offline — lagu diputar lewat YouTube (bisa ada iklan).';
+      el.style.color = c ? 'var(--ac)' : '#e5484d';
+    });
   }
 
   // ---------------------------------------------------------------- media session + PiP
