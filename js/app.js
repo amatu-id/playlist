@@ -318,12 +318,15 @@
     if (Q.i < Q.list.length - 1) { Q.i++; return startCur(); }
     if (S.repeat === 1) { Q.i = 0; return startCur(); }
     if (S.set.autoRadio) {
-      const extra = await similarTo(cur()).catch(() => []);
+      let extra = await similarTo(cur()).catch(() => []);
+      if (!extra.length) extra = await similarTo(cur()).catch(() => []);   // first call can hit a cold server
       if (extra.length) {
         Q.list.push(...extra); Q.i++;
         toast('Autoplay: memutar lagu serupa');
         return startCur();
       }
+      // no similar songs reachable: keep the music going from the top of the queue instead of stopping
+      if (auto && Q.list.length > 1) { Q.i = 0; toast('Autoplay: mengulang antrean'); return startCur(); }
     }
     Engine.pause(); Engine.fade(1, 0);
     if (auto) Engine.seek(0);

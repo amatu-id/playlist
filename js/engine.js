@@ -11,7 +11,7 @@ window.Engine = (function () {
   const eff = () => (muted ? 0 : vol * fadeK);
 
   // ---------- YouTube
-  const yt = { p: null, ready: null, lastState: -1, wantPlay: false };
+  const yt = { p: null, ready: null, lastState: -1, err: false };
   function ytInit() {
     if (yt.ready) return yt.ready;
     yt.ready = new Promise((res, rej) => {
@@ -29,7 +29,7 @@ window.Engine = (function () {
               else if (e.data === 0) { emit('state', false); emit('end'); }
               else if (e.data === 3) emit('buffering');
             },
-            onError: (e) => { if (cur === 'yt') emit('error', { eng: 'yt', code: e.data }); },
+            onError: (e) => { yt.err = true; if (cur === 'yt') emit('error', { eng: 'yt', code: e.data }); },
           },
         });
       };
@@ -133,10 +133,12 @@ window.Engine = (function () {
     const start = opt.start || 0, auto = opt.autoplay !== false;
     stopOthers(spec.eng);
     cur = spec.eng;
+    want = auto; resetWd(); wd.resumes = [];
     emit('engine', cur);
     if (spec.eng === 'yt') {
       const p = await ytInit();
       if (cur !== 'yt') return;
+      yt.err = false; yt.lastState = -1; wd.at = performance.now();
       if (auto) p.loadVideoById({ videoId: spec.id, startSeconds: start });
       else p.cueVideoById({ videoId: spec.id, startSeconds: start });
       applyVol();
@@ -150,7 +152,7 @@ window.Engine = (function () {
       if (start) au.el.currentTime = start;
       applyVol(); applyRate();
       emit('fx', true);
-      if (auto) await au.el.play().catch((e) => { if (e.name === 'NotAllowedError') emit('state', false); });
+      if (auto) await au.el.play().catch((e) => { if (e.name === 'NotAllowedError') { want = false; emit('state', false); } });
     } else if (spec.eng === 'sp') {
       const api = await spInit();
       if (cur !== 'sp') return;
@@ -169,12 +171,16 @@ window.Engine = (function () {
     }
   }
 
-  function play() {
+  function play(auto) {
+    want = true;
+    if (!auto) wd.resumes = [];
+    wd.at = performance.now();
     if (cur === 'yt' && yt.p) yt.p.playVideo();
-    else if (cur === 'au' && au.a) { if (au.ctx && au.ctx.state === 'suspended') au.ctx.resume(); au.a.play().catch(() => {}); }
+    else if (cur === 'au' && au.a) { if (au.ctx && au.ctx.state !== 'running') au.ctx.resume(); au.a.play().catch(() => {}); }
     else if (cur === 'sp' && sp.c) sp.c.resume();
   }
   function pause() {
+    want = false;
     if (cur === 'yt' && yt.p) yt.p.pauseVideo();
     else if (cur === 'au' && au.a) au.a.pause();
     else if (cur === 'sp' && sp.c) sp.c.pause();
@@ -207,24 +213,68 @@ window.Engine = (function () {
     else if (cur === 'au' && au.a && !au.live) au.a.currentTime = t;
     else if (cur === 'sp' && sp.c) sp.c.seek(t);
   }
-  let fadeRaf = 0;
+  // Timer-driven (not requestAnimationFrame): rAF never fires while the window is minimized or the tab is in the
+  // background, which left the next song stuck at volume 0 and media-key "next" waiting forever.
+  let fadeT = 0, fadeDone = null;
   function fade(to, ms) {
-    cancelAnimationFrame(fadeRaf);
+    clearTimeout(fadeT);
+    if (fadeDone) { fadeDone(); fadeDone = null; }
     const from = fadeK, t0 = performance.now();
     if (!ms) { fadeK = to; applyVol(); return Promise.resolve(); }
     return new Promise((res) => {
-      const step = (now) => {
-        const k = Math.min(1, (now - t0) / ms);
+      fadeDone = res;
+      const step = () => {
+        const k = Math.min(1, (performance.now() - t0) / ms);
         fadeK = from + (to - from) * k;
         applyVol();
-        if (k < 1) fadeRaf = requestAnimationFrame(step); else res();
+        if (k < 1) fadeT = setTimeout(step, 30); else { fadeDone = null; res(); }
       };
-      fadeRaf = requestAnimationFrame(step);
+      step();
     });
   }
 
+  // ---------- keep playing: the page wants music unless the user paused it. A song the browser or YouTube paused
+  // on its own (window minimized, tab in the background, audio device change) is resumed, and a stream that stops
+  // advancing (relay / radio connection dropped) is reconnected at the same spot, then handed to the error path.
+  let want = false;
+  const wd = { t: -1, at: 0, fixes: 0, resumes: [] };
+  function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; }
+  function resume() {
+    const now = performance.now();
+    wd.resumes = wd.resumes.filter((x) => now - x < 60e3);
+    if (wd.resumes.length >= 4) return;   // something keeps pausing it: stop fighting
+    wd.resumes.push(now);
+    play(true);
+  }
+  setInterval(() => {
+    if (!want || !cur) return;
+    const now = performance.now();
+    if (cur === 'yt' && yt.p && !yt.err) {
+      const st = yt.lastState;
+      if (st === 2 || st === 5 || (st === -1 && now - wd.at > 6000)) resume();
+    } else if (cur === 'au' && au.a && au.a.getAttribute('src')) {
+      const a = au.a;
+      if (a.ended || a.seeking) { wd.at = now; return; }
+      if (a.paused) { if (now - wd.at > 1500) resume(); return; }
+      const t = a.currentTime;
+      if (t !== wd.t) { wd.t = t; wd.at = now; return; }
+      if (now - wd.at < (t > 0.5 ? 15e3 : 45e3)) return;
+      wd.at = now;
+      if (wd.fixes++ < 1) {
+        if (au.ctx && au.ctx.state !== 'running') au.ctx.resume();
+        a.src = a === au.raw ? au.raw.src : au.src;
+        if (t && !au.live) a.currentTime = t;
+        a.play().catch(() => {});
+      } else emit('error', { eng: 'au', code: 'stall' });
+    }
+  }, 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && want && !playing()) play(true);
+    if (!document.hidden && au.ctx && au.ctx.state !== 'running' && cur === 'au') au.ctx.resume();
+  });
+
   return {
-    on, load, play, pause, unlock, ytInit, playing, time, duration, buffered, seek, fade,
+    on, load, play: () => play(), pause, unlock, ytInit, playing, time, duration, buffered, seek, fade,
     toggle() { playing() ? pause() : play(); },
     get eng() { return cur; },
     setVol(v) { vol = v; applyVol(); },
@@ -236,6 +286,6 @@ window.Engine = (function () {
     hasFx() { return cur === 'au' && au.a === au.el; },
     isLive() { return cur === 'au' && au.live; },
     ytVideo() { return yt.p && yt.p.getVideoData ? yt.p.getVideoData() : null; },
-    stop() { stopOthers(null); cur = null; emit('engine', null); },
+    stop() { want = false; stopOthers(null); cur = null; emit('engine', null); },
   };
 })();
