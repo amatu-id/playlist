@@ -172,57 +172,17 @@
   let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0;
   const tried = new Set();
 
-  // ---------------------------------------------------------------- ad-free audio (MacBook relay → cloud)
-  // The Downloader relay on the MacBook streams the song's audio straight from YouTube (yt-dlp) → no ads, and it
-  // plays in the Hi-Fi engine so the EQ works too. With the MacBook off the same audio comes from a cloud server
-  // (public Invidious instances proxy YouTube's audio with CORS + Range). A dropped stream resumes at the same spot,
-  // a song neither can fetch tries another upload, and only when nothing ad-free works the YouTube player takes over
-  // so the music never stops.
+  // ---------------------------------------------------------------- ad-free audio (runs entirely from the web)
+  // Public Invidious servers proxy YouTube's audio with CORS + Range → no ads, and it plays in the Hi-Fi engine so the
+  // EQ works too. A dropped stream resumes at the same spot, a song no server can fetch tries another upload, and only
+  // when nothing ad-free works the YouTube player takes over so the music never stops.
   const AMT = window.AMATU;
-  const R = { url: new URLSearchParams(location.search).get('relay') || null, ok: false, wait: null, at: 0 };
   const rtoken = () => (AMT && AMT.sess() && AMT.sess().t) || '';
-  async function rHello(u) {
-    const r = await fetch(u + '/api/hello', { cache: 'no-store', signal: AbortSignal.timeout(6000) });
-    const j = await r.json();
-    if (!r.ok || !j.audio) throw new Error('relay lama');
-    return u;
-  }
-  function relay(force) {
-    if (R.wait) return R.wait;
-    if (!force && Date.now() - R.at < (R.ok ? 300e3 : 30e3)) return Promise.resolve(R.ok);
-    R.wait = (async () => {
-      const cands = [];
-      if (R.url) cands.push(R.url);
-      const c = AMT && AMT.jget('pt.dl.relay', null);
-      if (c && c.url && !cands.includes(c.url)) cands.push(c.url);
-      let u = null;
-      for (const x of cands) { try { u = await rHello(x); break; } catch (e) { /* next */ } }
-      if (!u && AMT && rtoken()) {
-        const d = await AMT.rpc('amt_relay_get', { p_token: rtoken(), p_name: 'downloader' }).catch(() => null);
-        if (d && d.url && !cands.includes(d.url)) { try { u = await rHello(d.url); AMT.jset('pt.dl.relay', { url: d.url, t: d.t }); } catch (e) { /* offline */ } }
-      }
-      R.ok = !!u; if (u) R.url = u; R.at = Date.now(); R.wait = null;
-      return R.ok;
-    })();
-    return R.wait;
-  }
-  // video id → promise of the relay stream path (/api/a/<token>); the path outlives tunnel address changes
+  // video id → promise of its audio link
   const AF = new Map();
-  function playPath(id) {
-    const q = () => fetch(R.url + '/api/play?id=' + encodeURIComponent(id), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(25000) });
-    return (async () => {
-      if (!(await relay())) throw new Error('offline');
-      let r;
-      try { r = await q(); }
-      catch (e) { if (!(await relay(true))) throw new Error('offline'); r = await q(); }   // tunnel moved → look it up again
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok || !j.u) throw new Error(j.error || 'relay ' + r.status);
-      return j.u;
-    })();
-  }
   // cloud: Invidious instances, the last one that worked first; the public list refreshes once a day
   const INV = ['https://yt.chocolatemoo53.com'];
-  const C = { list: null, at: 0, ok: null };
+  const C = { list: null, at: 0, ok: null, failAt: 0 };
   async function invList() {
     if (C.list && Date.now() - C.at < 864e5) return C.list;
     let l = [];
@@ -244,31 +204,25 @@
         const r = await fetch(`${h}/api/v1/videos/${encodeURIComponent(id)}?local=true&fields=adaptiveFormats`, { signal: AbortSignal.timeout(9000) });
         const fm = ((await r.json()).adaptiveFormats || []).filter((f) => /^audio\/mp4/.test(f.type || '') && f.url);
         const f = fm.find((f) => String(f.itag) === '140') || fm.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-        if (f) { C.ok = h; return new URL(f.url, h).href; }
+        if (f) { C.ok = h; C.failAt = 0; return new URL(f.url, h).href; }
       } catch (e) { /* next instance */ }
     }
     if (C.ok && l.length) C.ok = null;
+    C.failAt = Date.now();
     throw new Error('cloud');
-  }
-  // relay first (yt-dlp, works for every upload), the cloud when the MacBook is off or can't fetch it
-  function afSource(id) {
-    return playPath(id).catch((e) => {
-      if (e.message !== 'offline' && /fetch|network|abort|timeout/i.test(e.message)) { R.ok = false; R.at = 0; }
-      return cloudUrl(id);
-    });
   }
   function adFreeUrl(id, fresh) {
     let c = AF.get(id);
     if (fresh || !c || Date.now() - c.t > 2 * 3600e3) {
-      c = { p: afSource(id), t: Date.now() };
+      c = { p: cloudUrl(id), t: Date.now() };
       AF.set(id, c);
       c.p.catch(() => { if (AF.get(id) === c) AF.delete(id); });
       if (AF.size > 200) AF.delete(AF.keys().next().value);
     }
-    return c.p.then((u) => (u[0] === '/' ? R.url + u : u), () => null);
+    return c.p.catch(() => null);
   }
   // phones always use the audio stream: the YouTube iframe stops as soon as the screen locks or the browser is minimized
-  const adFreeOn = () => (S.set.adFree || Engine.phone) && (!!AMT || !!R.url);   // ?relay=… = local test relay
+  const adFreeOn = () => !!(S.set.adFree || Engine.phone);
   const wantsVideo = (t) => vidOverride.k === key(t) && vidOverride.v === true;
   async function ytSpec(t, id) {
     if (!adFreeOn() || wantsVideo(t)) return { eng: 'yt', id };
@@ -314,14 +268,15 @@
         renderNow(); addHist(t); loadLyrics(t);
         return;
       }
-      if (altTries === 1 && !R.ok && !C.ok) break;   // MacBook off and the cloud is down: other uploads won't help
+      if (altTries === 1 && !C.ok) break;   // the servers are down: other uploads won't help
     }
     ytFallback(t, tok, Q.t);
   }
-  // warm the relay for the next songs so they start instantly
+  const cloudDown = () => Date.now() - C.failAt < 60e3;
+  // look up the next songs early so they start instantly
   const warmId = (t) => (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
   function prefetchNext(withCur) {
-    if (!adFreeOn() || (!R.ok && !C.ok)) return;
+    if (!adFreeOn() || cloudDown()) return;
     for (const t of Q.list.slice(Q.i + (withCur ? 0 : 1), Q.i + 3)) {
       const id = warmId(t);
       if (id) adFreeUrl(id);
@@ -336,7 +291,7 @@
     similarTo(cur()).then((l) => {
       if (curKey() !== k || !l.length) return;
       ahead = { k, list: l };
-      const id = adFreeOn() && (R.ok || C.ok) && warmId(l[0]);
+      const id = adFreeOn() && !cloudDown() && warmId(l[0]);
       if (id) adFreeUrl(id);
     }, () => {});
   }
@@ -505,14 +460,13 @@
     if (!t) return;
     const tok = playTok;
     if (err.eng === 'au' && curSpec && curSpec.ar) {
-      // stream broke: the tunnel got a new address, the MacBook went off or a cloud link expired → same song, same spot
+      // stream broke or its link expired → same song, same spot
       const id = curSpec.ar, at = Engine.time();
       if (afFix++ < 3) {
-        if (R.ok) await relay(true);
         const url = await adFreeUrl(id, true);
         if (tok !== playTok) return;
         if (url) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }); return; }
-        if (!R.ok && !C.ok) return ytFallback(t, tok, at);
+        if (!C.ok) return ytFallback(t, tok, at);
       }
       tried.add(id);
       return afAlt(t, tok);
@@ -1443,8 +1397,7 @@
   // ---------------------------------------------------------------- lyrics
   // A timed lyric from a lyric site is only used when it was timed on this very recording (artist + length agree).
   // Otherwise the lines come from this song's own audio: first the ones already written (shared in the cloud), then the
-  // cloud (edge fn amatu-lirik → Gemini, no MacBook needed), then the relay's Whisper as a backup. Lyrics of other
-  // recordings only help spelling. Lines not in Indonesian get an Indonesian translation underneath.
+  // cloud (edge fn amatu-lirik → Gemini). Lyrics of other recordings only help spelling. Lines not in Indonesian get an Indonesian translation underneath.
   const LY = { key: '', data: null, state: 'idle', tr: null };
   const LYC = new Map();   // track + upload → { data, tr } for this visit
   let lyOff = 0, lyLast = -2, lyUserScroll = 0, aiPause = 0;
@@ -1468,33 +1421,6 @@
     if (!L.length) return { instrumental: true, gen: true };
     return { synced: withGaps(L), plain: L.map((l) => l.x).join('\n'), source: 'otomatis dari audio (AI)', gen: true };
   }
-  // Whisper's times are from this audio but it mishears sung words: keep its times, take the words from the known lyrics
-  const lySkel = (s) => lyNorm(s).replace(/[^\p{L}\p{N}]/gu, '');
-  function lySim(a, b) {
-    if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
-    const g = new Map();
-    for (let i = 0; i < a.length - 1; i++) { const k = a.slice(i, i + 2); g.set(k, (g.get(k) || 0) + 1); }
-    let hit = 0;
-    for (let i = 0; i < b.length - 1; i++) { const k = b.slice(i, i + 2), n = g.get(k) || 0; if (n) { hit++; g.set(k, n - 1); } }
-    return (2 * hit) / (a.length + b.length - 2);
-  }
-  function alignRef(lines, ref) {
-    const R = ref.split('\n').map((x) => x.trim()).filter(Boolean).map((x) => ({ x, n: lySkel(x) }));
-    const out = [];
-    for (const l of lines || []) {
-      const n = lySkel(l.x);
-      if (n.length < 6) continue;
-      let best = null, s = 0;
-      for (const r of R) { const v = lySim(n, r.n); if (v > s) { s = v; best = r; } }
-      if (!best || s < 0.6) continue;
-      const last = out[out.length - 1];
-      if (last && last.x === best.x && l.t - last.t < 12) continue;   // one sung line split in two
-      out.push({ t: Math.round((l.t + 0.4) * 10) / 10, x: best.x });   // Whisper's segments open just before the voice
-    }
-    // the first segment always opens at the start of its window, however long the intro is
-    if (out.length > 1 && out[0].t < 1.5 && out[1].t - out[0].t > 10) out[0].t = Math.round((out[1].t - 5) * 10) / 10;
-    return out.length >= Math.max(4, new Set(R.map((r) => r.n)).size * 0.3) ? out : null;
-  }
   async function cloudLyrics(t, id) {
     if (!AMT) return null;
     const d = await AMT.rpc('amt_lyrics_get', { p_id: id }).catch(() => null);
@@ -1512,15 +1438,6 @@
       await sleepMs(j.busy ? 20e3 : 45e3);   // another device is writing it / Gemini is overloaded
     }
     return null;
-  }
-  async function genLyrics(t, id, ref) {
-    const q = API.lyricQuery(t);
-    const r = await fetch(R.url + '/api/lyrics?' + new URLSearchParams({ id, hint: `${q.title}, ${q.artist}. ${(ref || '').replace(/\s+/g, ' ').slice(0, 150)}` }), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(600e3) });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.error || 'relay ' + r.status);
-    // a backup: never stored, so the song gets better lines as soon as the cloud can write them
-    const L = ref ? alignRef(j.lines, ref) : (j.lines || []).length >= 6 ? j.lines : null;   // a few stray lines are noise, not lyrics
-    return L ? Object.assign(lyFromLines(t, L), { weak: true }) : null;
   }
   // the length of the audio actually playing (a search result often has none, and another upload has its own)
   async function lyLength(t, k) {
@@ -1558,14 +1475,9 @@
         if (f.text) lyShow(f.text, 'ok'); else { LY.state = 'gen'; refreshLyrics(); }   // words first when the right ones are known
         d = await aiLyrics(t, id, k, f.ref).catch(() => null);
         if (LY.key !== k) return;
-        if (!d && (AMT || R.url) && (await relay())) {
-          if (LY.key !== k) return;
-          d = await genLyrics(t, id, f.ref).catch(() => null);
-          if (LY.key !== k) return;
-        }
       }
     }
-    const final = d && !d.weak && (d.gen || f.exact);   // anything less is tried again next time the song plays
+    const final = d && (d.gen || f.exact);   // anything less is tried again next time the song plays
     d = d || f.loose || f.text || null;
     if (!d && API.lyricsUnsure() && LY.retry < 3) later = true;
     lyShow(d, d ? 'ok' : later ? 'loading' : 'none');
@@ -1805,7 +1717,7 @@
     const seg = (k, opts) => `<div class="seg" data-seg="${k}">${opts.map(([v, l]) => `<button type="button" data-v="${v}" class="${String(S.set[k]) === String(v) ? 'on' : ''}">${l}</button>`).join('')}</div>`;
     const sw = (k) => `<button type="button" class="sw${S.set[k] ? ' on' : ''}" data-sw="${k}"></button>`;
     openModal(`<h3>Pengaturan <button class="ib" data-close>${icon('x')}</button></h3>
-      <div class="set-row"><div class="l"><b>Bebas iklan</b><span>Lagu YouTube diputar sebagai audio Hi-Fi tanpa iklan (EQ aktif) lewat server MacBook, atau server cloud saat MacBook mati. <i id="afSt">Memeriksa server…</i></span></div>${sw('adFree')}</div>
+      <div class="set-row"><div class="l"><b>Bebas iklan</b><span>Lagu YouTube diputar sebagai audio Hi-Fi tanpa iklan (EQ aktif) lewat server cloud. <i id="afSt">Memeriksa server…</i></span></div>${sw('adFree')}</div>
       <div class="set-row"><div class="l"><b>Lagu dari Spotify diputar via</b><span>Lagu penuh lewat YouTube, Spotify embed (lagu penuh bila login Spotify di browser), atau preview 30 dtk Hi-Fi dengan EQ.</span></div>${seg('spMode', [['yt', 'YouTube'], ['embed', 'Spotify'], ['preview', 'Preview']])}</div>
       <div class="set-row"><div class="l"><b>Transisi halus</b><span>Fade-in/out antar lagu (detik)</span></div>${seg('fade', [[0, 'Mati'], [2, '2'], [4, '4'], [6, '6'], [10, '10']])}</div>
       <div class="set-row"><div class="l"><b>Lanjutkan otomatis</b><span>Saat situs dibuka, lagu terakhir lanjut di detik yang sama. Browser bisa meminta satu sentuhan dulu; lagu yang terakhir Anda jeda tidak dilanjutkan.</span></div>${sw('autoResume')}</div>
@@ -1830,14 +1742,10 @@
   function afStatus(c) {
     const el = $('#afSt', c);
     if (!el) return;
-    if (!AMT && !R.url) { el.textContent = 'Perlu masuk Portal AMATU.'; return; }
     el.textContent = 'Memeriksa server…';
-    relay(true).then(async (ok) => {
-      if (ok) { el.textContent = '✓ Server MacBook aktif.'; el.style.color = 'var(--ac)'; return; }
-      el.textContent = 'MacBook offline — memeriksa server cloud…';
-      const c = await cloudUrl('dQw4w9WgXcQ').then(() => true, () => false);
-      el.textContent = c ? '✓ MacBook offline — memakai server cloud (tetap tanpa iklan).' : '✕ MacBook & server cloud offline — lagu diputar lewat YouTube (bisa ada iklan).';
-      el.style.color = c ? 'var(--ac)' : '#e5484d';
+    cloudUrl('dQw4w9WgXcQ').then(() => true, () => false).then((ok) => {
+      el.textContent = ok ? '✓ Server cloud aktif.' : '✕ Server cloud offline — lagu diputar lewat YouTube (bisa ada iklan).';
+      el.style.color = ok ? 'var(--ac)' : '#e5484d';
     });
   }
 
@@ -2024,7 +1932,7 @@
   else renderPanel();
   // the first tap/click/key unlocks audio, so songs start by themselves even when their stream arrives later
   for (const ev of ['pointerdown', 'keydown', 'touchend', 'click']) document.addEventListener(ev, () => Engine.unlock(), { capture: true, passive: true });
-  if (adFreeOn()) relay().then((ok) => { if (ok && Q.list.length) prefetchNext(true); });
+  if (Q.list.length) prefetchNext(true);
   // lanjut otomatis: start by itself when the browser allows it, otherwise on the first touch anywhere
   (function armResume() {
     const shared = location.hash.startsWith('#t=');
@@ -2067,7 +1975,7 @@
   let hoverT = 0;
   const warm = (e) => {
     const el = e.target.closest && e.target.closest('.tr[data-i], [data-l][data-i]');
-    if (!el || !adFreeOn() || !R.ok) return;
+    if (!el || !adFreeOn() || cloudDown()) return;
     const L = LISTS.get((el.closest('[data-l]') || {}).dataset ? el.closest('[data-l]').dataset.l : '');
     const t = L && L.tracks[+el.dataset.i];
     const id = t && (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
@@ -2076,7 +1984,6 @@
   document.addEventListener('pointerover', (e) => { clearTimeout(hoverT); if (!touch && e.target.closest && e.target.closest('.pi, .pb')) hoverT = setTimeout(() => warm(e), 300); }, { passive: true });
   document.addEventListener('pointerdown', warm, { passive: true, capture: true });
   Engine.ytInit().catch(() => { /* loads again on first YouTube song */ });
-  setInterval(() => { if (adFreeOn() && !R.ok && document.visibilityState === 'visible') relay(); }, 60e3);
   window.addEventListener('resize', debounce(() => { dockKey = ''; }, 100));
   window.addEventListener('pagehide', () => {
     try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* ignore */ }

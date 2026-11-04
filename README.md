@@ -2,7 +2,7 @@
 
 Pemutar musik web di **https://amatu-id.github.io/playlist/** (bagian dari Portal AMATU).
 
-- **Bebas iklan**: lagu YouTube diputar sebagai audio Hi-Fi lewat relay MacBook (`dl-relay`, sama dengan Downloader: `/api/play` + `/api/a/<token>`, yt-dlp → m4a, bisa seek, EQ langsung aktif); lagu berikutnya di-prefetch. Relay offline → otomatis lewat YouTube player.
+- **Bebas iklan**: lagu YouTube diputar sebagai audio Hi-Fi langsung dari web lewat server Invidious publik (CORS + Range, bisa seek, EQ langsung aktif); lagu berikutnya disiapkan lebih awal. Server tidak tersedia → upload lain, lalu pemutar YouTube (bisa ada iklan). Tidak memakai MacBook sama sekali.
 - Lagu penuh dari YouTube / YouTube Music, playlist & tangga lagu Spotify (dicocokkan otomatis ke lagu penuh, atau diputar lewat Spotify embed / preview Hi-Fi).
 - Beranda kurasi: rak lagu chart live (Top 50 Indonesia harian, trending YouTube Indonesia, Top 100 Songs Global, Today's Top Hits), Tangga Lagu Indonesia, Terpopuler Minggu Ini, Baru & Lagi Naik, Viral & Joget, K-Pop/J-Pop, Genre Dunia, Religi, Pop Indonesia, Pop Jazz & City Pop, lagu hits lainnya, hits dunia.
 - Cari lagu, video, album, artis, playlist; tempel link YouTube/Spotify.

@@ -95,7 +95,7 @@ window.Engine = (function () {
   })();
 
   // A user gesture (tap/click/key) unlocks the Hi-Fi element + AudioContext once, so a track whose stream URL
-  // arrives seconds later (ad-free relay) still starts by itself — Safari/iOS otherwise blocks that play().
+  // arrives seconds later (ad-free server) still starts by itself — Safari/iOS otherwise blocks that play().
   let unlocked = false;
   function unlock() {
     if (!IOS) try { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); } catch (e) { /* no Web Audio */ }
@@ -304,7 +304,7 @@ window.Engine = (function () {
 
   // ---------- keep playing: the page wants music unless the user paused it. A song the browser or YouTube paused
   // on its own (window minimized, tab in the background, audio device change) is resumed, and a stream that stops
-  // advancing (relay / radio connection dropped) is reconnected at the same spot, then handed to the error path.
+  // advancing (audio server / radio connection dropped) is reconnected at the same spot, then handed to the error path.
   let want = false;
   const wd = { t: -1, at: 0, fixes: 0, resumes: [] };
   function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; }
