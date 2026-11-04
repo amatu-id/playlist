@@ -269,15 +269,16 @@ async function handle(u: URL) {
     };
     const d = await ne('search/get?' + new URLSearchParams({ s: `${title} ${artist}`, type: '1', limit: '10' }));
     const nt = norm(title), na = norm(artist);
-    for (const x of d.result?.songs || []) {
-      if (norm(x.name) !== nt) continue;
-      // same title is not enough: the artist or the exact length has to agree
+    // same title is not enough: the artist or the exact length has to agree. The page only trusts the timing when both do.
+    const cand = (d.result?.songs || []).filter((x: J) => norm(x.name) === nt).map((x: J) => {
       const ar = norm((x.artists || []).map((y: J) => y.name).join(' '));
-      if (!(na && ar && (ar.includes(na) || na.includes(ar))) && !(sec && Math.abs(x.duration / 1000 - sec) <= 3)) continue;
+      return { id: x.id, sec: Math.round(x.duration / 1000), artist: !!(na && ar && (ar.includes(na) || na.includes(ar))), len: !!(sec && Math.abs(x.duration / 1000 - sec) <= 3) };
+    }).filter((x: J) => x.artist || x.len).sort((p: J, q: J) => (+q.artist + +q.len) - (+p.artist + +p.len));
+    for (const x of cand) {
       const l = await ne('song/lyric?' + new URLSearchParams({ id: String(x.id), lv: '1' }));
       const lines = String(l.lrc?.lyric || '').split('\n')
         .filter((y) => !/\]\s*[^\]]*[\u4e00-\u9fff][^\]]*[:：]/.test(y) && !/\]\s*(lyricist|composer|arranger|producer)\s*[:：]/i.test(y));
-      if (lines.filter((y) => /\]\s*\S/.test(y)).length >= 4 && !/纯音乐/.test(lines.join(''))) return { lrc: lines.join('\n') };
+      if (lines.filter((y) => /\]\s*\S/.test(y)).length >= 4 && !/纯音乐/.test(lines.join(''))) return { lrc: lines.join('\n'), sec: x.sec, artist: x.artist };
     }
     return { lrc: null };
   }

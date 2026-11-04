@@ -4,7 +4,7 @@ window.API = (function () {
   const mem = new Map();
 
   function edge(params) {
-    const q = new URLSearchParams(Object.assign({ v: '2' }, params)).toString();
+    const q = new URLSearchParams(Object.assign({ v: '3' }, params)).toString();
     if (mem.has(q)) return mem.get(q);
     const p = fetch(EDGE + '/?' + q).then((r) => r.json()).then((d) => {
       if (d.error) throw new Error(d.error);
@@ -85,51 +85,89 @@ window.API = (function () {
   }
   // a miss while lrclib is failing says nothing about the song: worth asking again
   const lyricsUnsure = () => Date.now() - lrcBad < 60e3;
-  async function lrclib(t) {
+
+  // A timed lyric only fits the recording it was timed on, and one song title often has a dozen recordings (covers,
+  // remixes, other uploads). So timing is trusted only when the artist AND the length agree with the audio being played;
+  // any other lyric of that title is at most text: a spelling reference for the lyrics written from the audio.
+  const isArtist = (t, q, name) => {
+    const n = lnorm(name);
+    if (!n) return false;
+    return [q.artist].concat((t.artists || []).map((a) => a.name)).some((a) => {
+      const x = lnorm((a || '').replace(/\s*-\s*topic$/i, ''));
+      return x && (x === n || (Math.min(x.length, n.length) >= 3 && (x.includes(n) || n.includes(x))));
+    });
+  };
+  const sameLen = (d, sec) => !sec || (d && Math.abs(d - sec) <= 3);
+  const fits = (L, sec) => !!(L && L.length) && (!sec || L[L.length - 1].t <= sec + 1);
+  const textOf = (L) => L.map((l) => l.x).filter(Boolean).join('\n');
+  async function lrclib(t, sec) {
+    const f = { exact: null, seen: [] };
     for (const q of lyricQuery(t).alts) {
-      const x = await lrclibOne(t, q.title, q.artist);
-      if (x) return x;
+      await lrclibOne(t, q, sec, f);
+      if (f.exact) return f;
     }
-    return null;
+    return f;
   }
-  async function lrclibOne(t, title, artist) {
-    const pick = (x) => x && (x.syncedLyrics || x.plainLyrics || x.instrumental) ? { synced: parseLrc(x.syncedLyrics), plain: x.plainLyrics || '', instrumental: x.instrumental, source: 'lrclib' } : null;
-    const p = new URLSearchParams({ artist_name: artist, track_name: title });
-    if (t.sec) p.set('duration', t.sec);
-    const g = pick(await lrc('get?' + p));
-    if (g) return g;
-    const nt = lnorm(title);
-    let best = null;
-    const short = title.split(' ').length > 3 ? title.split(' ').slice(0, 3).join(' ') : '';   // "Song Artist" glued titles
-    for (const q of [`${title} ${artist}`.trim(), title, short].filter(Boolean)) {
-      const arr = (await lrc('search?' + new URLSearchParams({ q }))) || [];
-      for (const x of arr) {
-        if (!x.syncedLyrics && !x.plainLyrics) continue;
-        const xt = lnorm(x.trackName);
-        if (!nt || !(xt === nt || xt.includes(nt) || (nt.startsWith(xt) && xt.length >= Math.min(nt.length, 8)))) continue;   // a different song
-        if (!best) best = x;
-        if (x.syncedLyrics && t.sec && Math.abs(x.duration - t.sec) < 4) { best = x; break; }
+  async function lrclibOne(t, q, sec, f) {
+    const take = (x) => {
+      const mine = isArtist(t, q, x.artistName), L = parseLrc(x.syncedLyrics);
+      if (mine && sameLen(x.duration, sec)) {
+        if (x.instrumental) { f.exact = { instrumental: true, source: 'lrclib' }; return true; }
+        if (fits(L, sec)) { f.exact = { synced: L, plain: x.plainLyrics || textOf(L), source: 'lrclib' }; return true; }
       }
-      if (best) break;
+      const plain = x.plainLyrics || (L ? textOf(L) : '');
+      if (plain) f.seen.push({ plain, mine, by: lnorm(x.artistName) });
+      return false;
+    };
+    if (q.artist && q.title) {
+      const p = new URLSearchParams({ artist_name: q.artist, track_name: q.title });
+      if (sec) p.set('duration', sec);
+      const g = await lrc('get?' + p);
+      if (g && take(g)) return;
     }
-    return pick(best);
+    const nt = lnorm(q.title);
+    if (!nt) return;
+    const short = q.title.split(' ').length > 3 ? q.title.split(' ').slice(0, 3).join(' ') : '';   // "Song Artist" glued titles
+    for (const s of [`${q.title} ${q.artist}`.trim(), q.title, short].filter(Boolean)) {
+      for (const x of (await lrc('search?' + new URLSearchParams({ q: s }))) || []) {
+        const xt = lnorm(x.trackName);
+        if (xt === nt || xt.includes(nt) || (nt.startsWith(xt) && xt.length >= Math.min(nt.length, 8))) { if (take(x)) return; }   // else a different song
+      }
+      if (f.seen.some((y) => y.mine)) return;
+    }
   }
   async function ytLyrics(id) {
     const d = await edge({ a: 'lyrics', id });
     const l = d.lyrics;
     return l && (l.plain || '').trim() ? { synced: l.synced && l.synced.length ? l.synced : null, plain: l.plain, source: l.source || 'YouTube Music' } : null;
   }
-  async function neLyrics(t) {
+  async function neLyrics(t, sec) {
     const q = lyricQuery(t);
-    const d = await edge({ a: 'lrc', t: q.title, ar: q.artist, d: t.sec || 0 });
+    const d = await edge({ a: 'lrc', t: q.title, ar: q.artist, d: sec || 0 });
     const synced = parseLrc(d.lrc);
-    return synced ? { synced, plain: synced.map((l) => l.x).join('\n'), source: 'NetEase' } : null;
+    return synced ? { synced, plain: textOf(synced), artist: !!d.artist, sec: d.sec || 0, source: 'NetEase' } : null;
   }
-  async function lyrics(t, ytId) {
-    const a = await lrclib(t).catch(() => null);
-    if (a) return a;
-    const b = ytId ? await ytLyrics(ytId).catch(() => null) : null;
-    return b || neLyrics(t).catch(() => null);
+  // → { exact: lyric timed on this recording | null, text: right song, untimed | null, loose: right song, timing unproven | null, ref: spelling reference }
+  async function lyrics(t, ytId, sec) {
+    const f = await lrclib(t, sec).catch(() => ({ exact: null, seen: [] }));
+    if (f.exact) return { exact: f.exact };
+    // the song's own YouTube Music lyric is timed on that audio track; on a video or another upload it is only the right text
+    const y = ytId ? await ytLyrics(ytId).catch(() => null) : null;
+    if (y && y.synced && t.kind === 'song' && ytId === t.id && fits(y.synced, sec)) return { exact: y };
+    const n = await neLyrics(t, sec).catch(() => null);
+    if (n && n.artist && sameLen(n.sec, sec) && fits(n.synced, sec)) return { exact: n };
+    const mine = f.seen.find((x) => x.mine);
+    // reference: same artist first, else the artist with the most entries (usually the original, not a one-off cover)
+    const by = {};
+    for (const x of f.seen) by[x.by] = (by[x.by] || 0) + 1;
+    const top = f.seen.slice().sort((a, b) => by[b.by] - by[a.by])[0];
+    const textual = (mine && mine.plain) || (y && y.plain) || (n && n.artist && n.plain) || '';
+    return {
+      exact: null,
+      text: textual ? { plain: textual, source: 'text' } : null,
+      loose: y && y.synced && fits(y.synced, sec) ? y : null,
+      ref: textual || (top && top.plain) || (n && n.plain) || '',
+    };
   }
 
   // Indonesian translation per line (Google's Chrome translate endpoint — CORS-open, detects each line's language)

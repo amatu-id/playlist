@@ -1441,77 +1441,137 @@
   $('#tTimer').onclick = (e) => openMenu([{ head: 'Timer tidur' }].concat([5, 15, 30, 45, 60, 90].map((m) => ({ label: m + ' menit', run: () => { sleep.at = Date.now() + m * 60000; sleep.end = false; renderSleep(); toast(`Musik berhenti dalam ${m} menit`); } })), [{ label: 'Akhir lagu ini', run: () => { sleep.end = true; sleep.at = 0; renderSleep(); toast('Berhenti setelah lagu ini'); } }, { label: 'Matikan timer', check: !sleep.at && !sleep.end, run: () => { sleep.at = 0; sleep.end = false; renderSleep(); } }]), e.currentTarget);
 
   // ---------------------------------------------------------------- lyrics
-  // lyric sites first, then lyrics already written from the audio (shared in the cloud). A song nobody has written yet
-  // goes to the cloud (edge fn amatu-lirik → Gemini, no MacBook needed); the relay's Whisper is the backup if that fails.
-  // Lines not in Indonesian get an Indonesian translation underneath.
+  // A timed lyric from a lyric site is only used when it was timed on this very recording (artist + length agree).
+  // Otherwise the lines come from this song's own audio: first the ones already written (shared in the cloud), then the
+  // cloud (edge fn amatu-lirik → Gemini, no MacBook needed), then the relay's Whisper as a backup. Lyrics of other
+  // recordings only help spelling. Lines not in Indonesian get an Indonesian translation underneath.
   const LY = { key: '', data: null, state: 'idle', tr: null };
-  const LYC = new Map();   // track key → { data, tr } for this visit
-  let lyOff = 0, lyLast = -2, lyUserScroll = 0;
+  const LYC = new Map();   // track + upload → { data, tr } for this visit
+  let lyOff = 0, lyLast = -2, lyUserScroll = 0, aiPause = 0;
   const ytIdOf = (t) => t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' ? S.match[t.id] || null : null;
   const lyNorm = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  const sleepMs = (ms) => new Promise((ok) => setTimeout(ok, ms));
+  // long instrumental parts: the last sung line should not stay lit until the next verse
+  function withGaps(L) {
+    const gaps = L.slice(1).map((l, i) => l.t - L[i].t).filter((g) => g > 0).sort((a, b) => a - b);
+    const m = gaps[gaps.length >> 1] || 6, out = [];
+    L.forEach((l, i) => {
+      out.push(l);
+      const nx = L[i + 1];
+      if (nx && l.x && nx.x && nx.t - l.t > Math.max(12, m * 2.5)) out.push({ t: Math.round((l.t + Math.max(m * 1.2, 5)) * 10) / 10, x: '' });
+    });
+    return out;
+  }
   function lyFromLines(t, lines) {
     const q = API.lyricQuery(t);
     const L = (lines || []).filter((l) => lyNorm(l.x) !== lyNorm(`${q.title} ${q.artist}`));
     if (!L.length) return { instrumental: true, gen: true };
-    return { synced: L, plain: L.map((l) => l.x).join('\n'), source: 'otomatis dari audio (AI)', gen: true };
+    return { synced: withGaps(L), plain: L.map((l) => l.x).join('\n'), source: 'otomatis dari audio (AI)', gen: true };
+  }
+  // Whisper's times are from this audio but it mishears sung words: keep its times, take the words from the known lyrics
+  const lySkel = (s) => lyNorm(s).replace(/[^\p{L}\p{N}]/gu, '');
+  function lySim(a, b) {
+    if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
+    const g = new Map();
+    for (let i = 0; i < a.length - 1; i++) { const k = a.slice(i, i + 2); g.set(k, (g.get(k) || 0) + 1); }
+    let hit = 0;
+    for (let i = 0; i < b.length - 1; i++) { const k = b.slice(i, i + 2), n = g.get(k) || 0; if (n) { hit++; g.set(k, n - 1); } }
+    return (2 * hit) / (a.length + b.length - 2);
+  }
+  function alignRef(lines, ref) {
+    const R = ref.split('\n').map((x) => x.trim()).filter(Boolean).map((x) => ({ x, n: lySkel(x) }));
+    const out = [];
+    for (const l of lines || []) {
+      const n = lySkel(l.x);
+      if (n.length < 6) continue;
+      let best = null, s = 0;
+      for (const r of R) { const v = lySim(n, r.n); if (v > s) { s = v; best = r; } }
+      if (!best || s < 0.6) continue;
+      const last = out[out.length - 1];
+      if (last && last.x === best.x && l.t - last.t < 12) continue;   // one sung line split in two
+      out.push({ t: Math.round((l.t + 0.4) * 10) / 10, x: best.x });   // Whisper's segments open just before the voice
+    }
+    // the first segment always opens at the start of its window, however long the intro is
+    if (out.length > 1 && out[0].t < 1.5 && out[1].t - out[0].t > 10) out[0].t = Math.round((out[1].t - 5) * 10) / 10;
+    return out.length >= Math.max(4, new Set(R.map((r) => r.n)).size * 0.3) ? out : null;
   }
   async function cloudLyrics(t, id) {
     if (!AMT) return null;
     const d = await AMT.rpc('amt_lyrics_get', { p_id: id }).catch(() => null);
     return d && d.lines ? lyFromLines(t, d.lines) : null;
   }
-  async function aiLyrics(t, id, k) {
-    if (!AMT || !rtoken() || t.sec > 900) return null;
+  async function aiLyrics(t, id, k, ref) {
+    if (!AMT || !rtoken() || t.sec > 900 || Date.now() < aiPause) return null;
     const q = API.lyricQuery(t);
     for (let i = 0; i < 6 && LY.key === k; i++) {
-      const r = await fetch(API.EDGE.replace('amatu-music', 'amatu-lirik') + '?' + new URLSearchParams({ id, t: q.title, ar: q.artist }), { headers: { 'x-amatu': rtoken() }, signal: AbortSignal.timeout(170e3) });
+      const r = await fetch(API.EDGE.replace('amatu-music', 'amatu-lirik') + '?' + new URLSearchParams({ id, t: q.title, ar: q.artist }), { method: 'POST', headers: { 'x-amatu': rtoken(), 'Content-Type': 'application/json' }, body: JSON.stringify({ ref: (ref || '').slice(0, 5000) }), signal: AbortSignal.timeout(170e3) });
       const j = await r.json().catch(() => ({}));
       if (j.lines) return lyFromLines(t, j.lines);
+      if (j.error === 'kuota' || j.error === 'limit') { aiPause = Date.now() + 1800e3; return null; }   // daily allowance gone: no point in asking every song
       if (!j.busy && !(/^gemini/.test(j.error || '') && i < 2)) return null;
-      await new Promise((ok) => setTimeout(ok, j.busy ? 20e3 : 45e3));   // another device is writing it / Gemini is overloaded
+      await sleepMs(j.busy ? 20e3 : 45e3);   // another device is writing it / Gemini is overloaded
     }
     return null;
   }
-  async function genLyrics(t, id) {
+  async function genLyrics(t, id, ref) {
     const q = API.lyricQuery(t);
-    const r = await fetch(R.url + '/api/lyrics?' + new URLSearchParams({ id, hint: `${q.title}, ${q.artist}.` }), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(600e3) });
+    const r = await fetch(R.url + '/api/lyrics?' + new URLSearchParams({ id, hint: `${q.title}, ${q.artist}. ${(ref || '').replace(/\s+/g, ' ').slice(0, 150)}` }), { cache: 'no-store', headers: { 'X-Amatu': rtoken() }, signal: AbortSignal.timeout(600e3) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.error || 'relay ' + r.status);
-    if (AMT && rtoken()) AMT.rpc('amt_lyrics_set', { p_token: rtoken(), p_id: id, p_lines: j.lines || [], p_lang: j.lang || '', p_by: j.by || 'whisper' }).catch(() => { /* stays on the MacBook only */ });
-    return lyFromLines(t, j.lines);
+    // a backup: never stored, so the song gets better lines as soon as the cloud can write them
+    const L = ref ? alignRef(j.lines, ref) : (j.lines || []).length >= 6 ? j.lines : null;   // a few stray lines are noise, not lyrics
+    return L ? Object.assign(lyFromLines(t, L), { weak: true }) : null;
   }
+  // the length of the audio actually playing (a search result often has none, and another upload has its own)
+  async function lyLength(t, k) {
+    for (let i = 0; i < 32 && LY.key === k; i++) {
+      if (key(cur()) === key(t) && Engine.eng && (Engine.eng !== 'yt' || Engine.playing())) {
+        const d = Engine.duration();
+        if (d > 20 && isFinite(d)) return Math.round(d);
+      }
+      await sleepMs(250);
+    }
+    return t.sec || 0;
+  }
+  const lyShow = (d, state) => { LY.data = d; LY.state = state; refreshLyrics(); };
   async function loadLyrics(t, again) {
-    const k = key(t);
+    const k = key(t) + '|' + (ytIdOf(t) || '');
     if (LY.key === k && !again) return;
     LY.key = k; LY.data = null; LY.tr = null;
     if (t.src === 'radio') { LY.state = 'none'; refreshLyrics(); return; }
     const c = LYC.get(k);
     if (c) { LY.data = c.data; LY.tr = c.tr; LY.state = 'ok'; refreshLyrics(); return; }
     if (!again) { LY.state = 'loading'; LY.retry = 0; lyOff = 0; refreshLyrics(); }
-    let d = null;
     const id = t.src === 'sp' && !S.match[t.id] ? await API.match(t).then((m) => m && m.id).catch(() => null) : ytIdOf(t);
     if (LY.key !== k) return;
-    d = await API.lyrics(t, id).catch(() => null);
+    const sec = await lyLength(t, k);
     if (LY.key !== k) return;
+    const f = await API.lyrics(t, id, sec).catch(() => ({ exact: null }));
+    if (LY.key !== k) return;
+    let d = f.exact, later = false;
     if (!d && id) {
       d = await cloudLyrics(t, id);
       if (LY.key !== k) return;
-      if (!d) {
-        LY.state = 'gen'; refreshLyrics();
-        d = await aiLyrics(t, id, k).catch(() => null);
+      // lrclib failing may hide a timed lyric: look again before spending the audio allowance
+      if (!d && API.lyricsUnsure() && LY.retry < 2) later = true;
+      else if (!d) {
+        if (f.text) lyShow(f.text, 'ok'); else { LY.state = 'gen'; refreshLyrics(); }   // words first when the right ones are known
+        d = await aiLyrics(t, id, k, f.ref).catch(() => null);
         if (LY.key !== k) return;
-      }
-      if (!d && (AMT || R.url) && (await relay())) {
-        if (LY.key !== k) return;
-        d = await genLyrics(t, id).catch(() => null);
-        if (LY.key !== k) return;
+        if (!d && (AMT || R.url) && (await relay())) {
+          if (LY.key !== k) return;
+          d = await genLyrics(t, id, f.ref).catch(() => null);
+          if (LY.key !== k) return;
+        }
       }
     }
-    LY.data = d; LY.state = d ? 'ok' : 'none';
-    refreshLyrics();
-    if (!d && API.lyricsUnsure() && LY.retry++ < 3) setTimeout(() => { if (LY.key === k) loadLyrics(t, true); }, 45e3);
+    const final = d && !d.weak && (d.gen || f.exact);   // anything less is tried again next time the song plays
+    d = d || f.loose || f.text || null;
+    if (!d && API.lyricsUnsure() && LY.retry < 3) later = true;
+    lyShow(d, d ? 'ok' : later ? 'loading' : 'none');
+    if (later) { LY.retry++; setTimeout(() => { if (LY.key === k) loadLyrics(t, true); }, 45e3); }
     if (!d || d.instrumental) return;
-    LYC.set(k, { data: d, tr: null });
+    if (final) LYC.set(k, { data: d, tr: null });
     const lines = d.synced ? d.synced.map((l) => l.x) : d.plain.split('\n');
     API.translate(lines).then((r) => {
       const tr = r.lines.map((x, i) => (x && !/^(id|ms)$/.test(r.lang[i]) && lyNorm(x) !== lyNorm(lines[i]) ? x : ''));
@@ -1560,6 +1620,8 @@
       }
     }
   }
+
+  setInterval(() => { if (!document.hidden && Engine.eng && Engine.playing()) syncLyrics(Engine.time()); }, 100);   // the main tick is 250 ms
 
   // floating lyrics: left third of the screen while a song plays (checked every tick, so no init-order worries)
   const fly = $('#fly'), flyB = $('#flyB');
