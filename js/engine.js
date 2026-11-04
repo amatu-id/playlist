@@ -10,6 +10,14 @@ window.Engine = (function () {
   let cur = null, vol = 0.8, muted = false, fadeK = 1, rate = 1, eqState = null, fxBypass = false;
   const eff = () => (muted ? 0 : vol * fadeK);
 
+  // Phones. iOS suspends Web Audio when the screen locks and an element routed through it falls silent with it, so
+  // on iOS songs always play from a plain element. Other phones do so too unless an EQ setting actually changes the sound.
+  const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const PHONE = IOS || /Android/.test(navigator.userAgent);
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* older Safari */ }
+  const fxUseful = (e) => !!e && e.on && (e.bands.some(Boolean) || !!e.pre || !!e.bass || !!e.treble || e.width !== 100 || !!e.bal || !!e.comp || e.room !== 'off');
+  const noGraph = () => IOS || (PHONE && !fxUseful(eqState));
+
   // ---------- YouTube
   const yt = { p: null, ready: null, lastState: -1, err: false };
   function ytInit() {
@@ -42,27 +50,30 @@ window.Engine = (function () {
   }
 
   // ---------- Hi-Fi audio
-  const au = { el: new Audio(), raw: new Audio(), ctx: null, fx: null, a: null, live: false, src: '' };
+  const au = { el: new Audio(), raw: new Audio(), ctx: null, fx: null, a: null, live: false, src: '', bridging: false, noCors: '' };
   au.el.crossOrigin = 'anonymous';
   au.el.preload = 'auto';
-  au.raw.preload = 'none';
+  au.raw.preload = 'auto';
+  const main = () => (noGraph() || au.noCors === au.src ? au.raw : au.el);
+  const isCur = (a) => cur === 'au' && au.a === a && !au.bridging;
   for (const a of [au.el, au.raw]) {
-    a.addEventListener('playing', () => { if (cur === 'au' && au.a === a) emit('state', true); });
-    a.addEventListener('pause', () => { if (cur === 'au' && au.a === a) emit('state', false); });
-    a.addEventListener('waiting', () => { if (cur === 'au' && au.a === a) emit('buffering'); });
-    a.addEventListener('ended', () => { if (cur === 'au' && au.a === a) { emit('state', false); emit('end'); } });
-    a.addEventListener('loadedmetadata', () => { if (cur === 'au' && au.a === a) emit('meta'); });
+    a.addEventListener('playing', () => { if (isCur(a)) emit('state', true); });
+    a.addEventListener('pause', () => { if (isCur(a)) emit('state', false); });
+    a.addEventListener('waiting', () => { if (isCur(a)) emit('buffering'); });
+    a.addEventListener('ended', () => { if (isCur(a)) { emit('state', false); emit('end'); } });
+    a.addEventListener('loadedmetadata', () => { if (isCur(a)) emit('meta'); });
   }
   au.el.addEventListener('error', () => {
-    if (cur !== 'au' || au.a !== au.el || !au.el.getAttribute('src') || au.el.src.startsWith('data:')) return;
+    if (!isCur(au.el) || !au.el.getAttribute('src') || au.el.src.startsWith('data:')) return;
     // CORS refused (common for radio) → play untouched without FX
     if (au.live || au.src.startsWith('http')) {
+      au.noCors = au.src;
       au.a = au.raw; au.raw.src = au.src; applyVol(); applyRate();
       au.raw.play().catch((e) => emit('error', { eng: 'au', code: 'play', msg: e.message }));
       emit('fx', false);
     } else emit('error', { eng: 'au', code: au.el.error && au.el.error.code });
   });
-  au.raw.addEventListener('error', () => { if (cur === 'au' && au.a === au.raw && au.raw.getAttribute('src')) emit('error', { eng: 'au', code: au.raw.error && au.raw.error.code }); });
+  au.raw.addEventListener('error', () => { if (isCur(au.raw) && au.raw.getAttribute('src') && !au.raw.src.startsWith('data:')) emit('error', { eng: 'au', code: au.raw.error && au.raw.error.code }); });
 
   function fxInit() {
     if (au.ctx) return;
@@ -73,24 +84,52 @@ window.Engine = (function () {
     au.fx.apply(fxBypass ? Object.assign({}, eqState, { on: false }) : eqState);
   }
 
+  // One second of silence (8 kHz, 8 bit) for priming and bridging.
+  const SILENT = (() => {
+    const n = 8000, b = new Uint8Array(44 + n).fill(128), d = new DataView(b.buffer);
+    const tag = (at, t) => { for (let i = 0; i < 4; i++) b[at + i] = t.charCodeAt(i); };
+    tag(0, 'RIFF'); d.setUint32(4, 36 + n, true); tag(8, 'WAVE'); tag(12, 'fmt '); d.setUint32(16, 16, true);
+    d.setUint16(20, 1, true); d.setUint16(22, 1, true); d.setUint32(24, 8000, true); d.setUint32(28, 8000, true);
+    d.setUint16(32, 1, true); d.setUint16(34, 8, true); tag(36, 'data'); d.setUint32(40, n, true);
+    return 'data:audio/wav;base64,' + btoa(String.fromCharCode.apply(null, b));
+  })();
+
   // A user gesture (tap/click/key) unlocks the Hi-Fi element + AudioContext once, so a track whose stream URL
   // arrives seconds later (ad-free relay) still starts by itself — Safari/iOS otherwise blocks that play().
   let unlocked = false;
-  const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
   function unlock() {
-    try { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); } catch (e) { /* no Web Audio */ }
-    if (unlocked || cur === 'au' || au.el.getAttribute('src')) return;
+    if (!IOS) try { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); } catch (e) { /* no Web Audio */ }
+    const a = main();
+    if (unlocked || cur === 'au' || a.getAttribute('src')) return;
     unlocked = true;
-    au.el.src = SILENT;
-    const p = au.el.play();
-    const done = () => { if (au.el.src === SILENT) { au.el.pause(); au.el.removeAttribute('src'); au.el.load(); } };
+    a.src = SILENT;
+    const p = a.play();
+    const done = () => { if (a.src === SILENT && !au.bridging) { a.pause(); a.removeAttribute('src'); a.load(); } };
     if (p && p.then) p.then(done, () => { unlocked = false; done(); }); else done();
+  }
+
+  // Between two songs nothing would be playing while the next stream is looked up, and a locked iPhone freezes the
+  // page in that gap so the next song never starts. Silence keeps the audio session, and with it this page, alive.
+  function bridge() {
+    if (!PHONE || cur === 'yt' || cur === 'sp') return;
+    const a = main();
+    if (au.bridging && !a.paused) return;
+    if (au.a && au.a !== a) au.a.pause();
+    au.bridging = true; au.a = a;
+    a.loop = true; a.src = SILENT;
+    a.play().catch(() => { /* not unlocked yet: the song itself asks again */ });
+  }
+  // A start position set before the metadata is loaded is ignored by some Safari versions.
+  function startAt(a, t) {
+    a.currentTime = t;
+    a.addEventListener('loadedmetadata', () => { if (a.src !== SILENT && Math.abs(a.currentTime - t) > 2) a.currentTime = t; }, { once: true });
   }
 
   // May this page start sound with no gesture? A silent clip must play and Web Audio must run, otherwise a song
   // would look like it is playing while nothing is heard.
   async function canAutoplay() {
     try { const a = new Audio(SILENT); await a.play(); a.pause(); } catch (e) { return false; }
+    if (noGraph()) return true;
     try {
       fxInit();
       if (au.ctx.state === 'suspended') await Promise.race([au.ctx.resume(), new Promise((r) => setTimeout(r, 400))]);
@@ -133,6 +172,20 @@ window.Engine = (function () {
     if (au.a) { au.a.playbackRate = rate; au.a.preservesPitch = true; }
   }
 
+  // Android: an EQ setting turned on or off mid-song moves the song between the plain and the EQ element, same second.
+  function reroute() {
+    const m = main();
+    if (cur !== 'au' || !au.a || au.a === m || au.bridging || !au.src) return;
+    const t = au.a.currentTime, on = !au.a.paused, o = au.a;
+    if (m === au.el) { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); }
+    o.pause(); o.removeAttribute('src');
+    au.a = m; m.loop = false; m.src = au.src;
+    if (t && !au.live) startAt(m, t);
+    applyVol(); applyRate();
+    emit('fx', m === au.el);
+    if (on) m.play().catch(() => {});
+  }
+
   function stopOthers(keep) {
     if (keep !== 'yt' && yt.p && yt.p.pauseVideo) try { yt.p.pauseVideo(); } catch (e) { /* not ready */ }
     if (keep !== 'au') { for (const a of [au.el, au.raw]) { a.pause(); } }
@@ -142,6 +195,7 @@ window.Engine = (function () {
   async function load(spec, opt) {
     opt = opt || {};
     const start = opt.start || 0, auto = opt.autoplay !== false;
+    au.bridging = false;
     stopOthers(spec.eng);
     cur = spec.eng;
     want = auto; resetWd(); wd.resumes = [];
@@ -154,16 +208,17 @@ window.Engine = (function () {
       else p.cueVideoById({ videoId: spec.id, startSeconds: start });
       applyVol();
     } else if (spec.eng === 'au') {
-      fxInit();
-      if (au.ctx.state === 'suspended') au.ctx.resume();
       au.live = !!spec.live; au.src = spec.url;
-      au.raw.pause(); au.raw.removeAttribute('src');
-      au.a = au.el;
-      au.el.src = spec.url;
-      if (start) au.el.currentTime = start;
+      const a = main(), o = a === au.el ? au.raw : au.el;
+      if (a === au.el) { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); }
+      o.pause(); o.removeAttribute('src');
+      au.a = a; a.loop = false;
+      a.src = spec.url;
+      if (start) startAt(a, start);
       applyVol(); applyRate();
-      emit('fx', true);
-      if (auto) await au.el.play().catch((e) => { if (e.name === 'NotAllowedError') { want = false; emit('state', false); } });
+      emit('fx', a === au.el);
+      // refused while the page is hidden: keep the intent, it starts when the watchdog or the user's return allows it
+      if (auto) await a.play().catch((e) => { if (e.name === 'NotAllowedError' && !document.hidden) { want = false; emit('state', false); } });
     } else if (spec.eng === 'sp') {
       const api = await spInit();
       if (cur !== 'sp') return;
@@ -192,36 +247,39 @@ window.Engine = (function () {
   }
   function pause() {
     want = false;
+    if (au.bridging) { au.bridging = false; if (au.a) au.a.pause(); }
     if (cur === 'yt' && yt.p) yt.p.pauseVideo();
     else if (cur === 'au' && au.a) au.a.pause();
     else if (cur === 'sp' && sp.c) sp.c.pause();
   }
   function playing() {
     if (cur === 'yt') return yt.lastState === 1 || yt.lastState === 3;
-    if (cur === 'au') return !!au.a && !au.a.paused;
+    if (cur === 'au') return !!au.a && !au.a.paused && !au.bridging;
     if (cur === 'sp') return !sp.paused;
     return false;
   }
   function time() {
     if (cur === 'yt' && yt.p && yt.p.getCurrentTime) return yt.p.getCurrentTime() || 0;
+    if (au.bridging) return 0;
     if (cur === 'au' && au.a) return au.a.currentTime || 0;
     if (cur === 'sp') return sp.pos;
     return 0;
   }
   function duration() {
     if (cur === 'yt' && yt.p && yt.p.getDuration) return yt.p.getDuration() || 0;
+    if (au.bridging) return 0;
     if (cur === 'au' && au.a) return isFinite(au.a.duration) ? au.a.duration : 0;
     if (cur === 'sp') return sp.dur;
     return 0;
   }
   function buffered() {
     if (cur === 'yt' && yt.p && yt.p.getVideoLoadedFraction) return yt.p.getVideoLoadedFraction() || 0;
-    if (cur === 'au' && au.a && au.a.buffered.length && duration()) return au.a.buffered.end(au.a.buffered.length - 1) / duration();
+    if (cur === 'au' && au.a && !au.bridging && au.a.buffered.length && duration()) return au.a.buffered.end(au.a.buffered.length - 1) / duration();
     return 0;
   }
   function seek(t) {
     if (cur === 'yt' && yt.p) yt.p.seekTo(t, true);
-    else if (cur === 'au' && au.a && !au.live) au.a.currentTime = t;
+    else if (cur === 'au' && au.a && !au.live && !au.bridging) au.a.currentTime = t;
     else if (cur === 'sp' && sp.c) sp.c.seek(t);
   }
   // Timer-driven (not requestAnimationFrame): rAF never fires while the window is minimized or the tab is in the
@@ -251,8 +309,8 @@ window.Engine = (function () {
   const wd = { t: -1, at: 0, fixes: 0, resumes: [] };
   function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; }
   function resume() {
-    const now = performance.now();
-    wd.resumes = wd.resumes.filter((x) => now - x < 60e3);
+    const now = performance.now(), win = document.hidden ? 600e3 : 60e3;   // another app taking the audio on a phone must win
+    wd.resumes = wd.resumes.filter((x) => now - x < win);
     if (wd.resumes.length >= 4) return;   // something keeps pausing it: stop fighting
     wd.resumes.push(now);
     play(true);
@@ -265,6 +323,7 @@ window.Engine = (function () {
       if (st === 2 || st === 5 || (st === -1 && now - wd.at > 6000)) resume();
     } else if (cur === 'au' && au.a && au.a.getAttribute('src')) {
       const a = au.a;
+      if (au.bridging) { if (a.paused && now - wd.at > 1500) { wd.at = now; a.play().catch(() => {}); } return; }
       if (a.ended || a.seeking) { wd.at = now; return; }
       if (a.paused) { if (now - wd.at > 1500) resume(); return; }
       const t = a.currentTime;
@@ -280,23 +339,28 @@ window.Engine = (function () {
     }
   }, 1000);
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && want && !playing()) play(true);
+    if (!document.hidden) wd.resumes = [];
+    if (!document.hidden && want && !playing() && !au.bridging) play(true);
     if (!document.hidden && au.ctx && au.ctx.state !== 'running' && cur === 'au') au.ctx.resume();
   });
 
   return {
-    on, load, play: () => play(), pause, unlock, canAutoplay, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade,
+    on, load, play: () => play(), pause, unlock, bridge, canAutoplay, phone: PHONE, ios: IOS, noGraph, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade,
     toggle() { playing() ? pause() : play(); },
     get eng() { return cur; },
     setVol(v) { vol = v; applyVol(); },
     setMuted(m) { muted = m; applyVol(); },
     setRate(r) { rate = r; applyRate(); },
     rates() { return cur === 'yt' && yt.p && yt.p.getAvailablePlaybackRates ? yt.p.getAvailablePlaybackRates() : [0.5, 0.75, 1, 1.25, 1.5, 2]; },
-    eq(e, bypass) { eqState = e; fxBypass = !!bypass; if (au.fx) au.fx.apply(bypass ? Object.assign({}, e, { on: false }) : e); },
+    eq(e, bypass) { eqState = e; fxBypass = !!bypass; if (au.fx) au.fx.apply(bypass ? Object.assign({}, e, { on: false }) : e); reroute(); },
     fx() { return au.fx; },
-    hasFx() { return cur === 'au' && au.a === au.el; },
+    hasFx() { return cur === 'au' && au.a === au.el && !au.bridging; },
     isLive() { return cur === 'au' && au.live; },
     ytVideo() { return yt.p && yt.p.getVideoData ? yt.p.getVideoData() : null; },
-    stop() { want = false; stopOthers(null); cur = null; emit('engine', null); },
+    stop(keepBridge) {
+      want = false;
+      if (keepBridge && au.bridging) stopOthers('au'); else { au.bridging = false; stopOthers(null); }
+      cur = null; emit('engine', null);
+    },
   };
 })();

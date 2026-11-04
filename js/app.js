@@ -267,7 +267,8 @@
     }
     return c.p.then((u) => (u[0] === '/' ? R.url + u : u), () => null);
   }
-  const adFreeOn = () => S.set.adFree && (!!AMT || !!R.url);   // ?relay=… = local test relay
+  // phones always use the audio stream: the YouTube iframe stops as soon as the screen locks or the browser is minimized
+  const adFreeOn = () => (S.set.adFree || Engine.phone) && (!!AMT || !!R.url);   // ?relay=… = local test relay
   const wantsVideo = (t) => vidOverride.k === key(t) && vidOverride.v === true;
   async function ytSpec(t, id) {
     if (!adFreeOn() || wantsVideo(t)) return { eng: 'yt', id };
@@ -275,11 +276,18 @@
     return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id };
   }
   // nothing ad-free answers: the YouTube player keeps the music going (it may show ads)
-  let ytFbAt = 0;
+  let ytFbAt = 0, bgRetry = 0;
   function ytFallback(t, tok, at) {
     if (tok !== playTok) return;
     const id = (curSpec && curSpec.ar) || [...tried][0] || (t.src === 'yt' ? t.id : S.match[t.id]);
     if (!id) return next(true);
+    // screen locked: the iframe could not play anyway, so stay alive on silence and ask the audio sources again
+    if (Engine.phone && document.hidden && bgRetry < 30) {
+      bgRetry++;
+      Engine.bridge();
+      setTimeout(() => { if (tok === playTok) startCur({ start: at > 1 ? at : 0 }); }, 20e3);
+      return;
+    }
     if (Date.now() - ytFbAt > 600e3) toast('Server bebas iklan tidak tersedia — memakai pemutar YouTube (bisa ada iklan)', 'err');
     ytFbAt = Date.now();
     curSpec = { eng: 'yt', id }; altTries = 3;
@@ -311,12 +319,26 @@
     ytFallback(t, tok, Q.t);
   }
   // warm the relay for the next songs so they start instantly
+  const warmId = (t) => (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
   function prefetchNext(withCur) {
     if (!adFreeOn() || (!R.ok && !C.ok)) return;
     for (const t of Q.list.slice(Q.i + (withCur ? 0 : 1), Q.i + 3)) {
-      const id = t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null;
+      const id = warmId(t);
       if (id) adFreeUrl(id);
     }
+  }
+  // last song of the queue: find what plays after it now, while it is still playing. On a locked phone the lookup
+  // after the song ended may never finish. Kept aside so the visible queue and "add to queue" don't change.
+  let ahead = null;
+  function warmRadio() {
+    if (!S.set.autoRadio || S.repeat === 1 || Q.i < Q.list.length - 1) return;
+    const k = curKey();
+    similarTo(cur()).then((l) => {
+      if (curKey() !== k || !l.length) return;
+      ahead = { k, list: l };
+      const id = adFreeOn() && (R.ok || C.ok) && warmId(l[0]);
+      if (id) adFreeUrl(id);
+    }, () => {});
   }
 
   const MTHUMB = {};
@@ -351,12 +373,15 @@
     Q.t = opt.start || 0;
     renderNow(); saveQ();
     $('#bar').classList.add('loading');
+    // a stream already warmed starts at once; only a real wait needs the silent bridge
+    const wait = opt.autoplay !== false ? setTimeout(() => { if (tok === playTok) Engine.bridge(); }, 50) : 0;
     const spec = await specFor(t).catch(() => null);
+    clearTimeout(wait);
     if (tok !== playTok) return;
     if (!spec) { toast('Lagu tidak tersedia', 'err'); return next(true); }
     if (spec.eng === 'af') {
       curSpec = null; tried.add(spec.ar);
-      Engine.stop(); return afAlt(t, tok);
+      Engine.bridge(); Engine.stop(true); return afAlt(t, tok);
     }
     curSpec = spec;
     if (spec.id) tried.add(spec.id);
@@ -370,7 +395,7 @@
     if (opt.autoplay !== false) addHist(t);
     renderNow();
     loadLyrics(t);
-    setTimeout(() => { if (tok === playTok) prefetchNext(); }, 2500);
+    setTimeout(() => { if (tok === playTok) { prefetchNext(); warmRadio(); } }, 2500);
   }
 
   function setQueue(tracks, i, ctx, opt) {
@@ -416,7 +441,10 @@
     if (Q.i < Q.list.length - 1) { Q.i++; return startCur(); }
     if (S.repeat === 1) { Q.i = 0; return startCur(); }
     if (S.set.autoRadio) {
-      let extra = await similarTo(cur()).catch(() => []);
+      const have = new Set(Q.list.map(key));
+      let extra = ahead && ahead.k === curKey() ? ahead.list.filter((x) => !have.has(key(x))) : [];
+      ahead = null;
+      if (!extra.length) extra = await similarTo(cur()).catch(() => []);
       if (!extra.length) extra = await similarTo(cur()).catch(() => []);   // first call can hit a cold server
       if (extra.length) {
         Q.list.push(...extra); Q.i++;
@@ -511,7 +539,10 @@
     if (S.repeat === 2) { Engine.seek(0); Engine.play(); return; }
     next(true);
   });
+  // other Amatu tabs drop their silent keep-alive (amatu.js) while a song plays here
+  const audioBc = 'BroadcastChannel' in window ? new BroadcastChannel('amatu-audio') : null;
   Engine.on('state', (p) => {
+    if (p) { bgRetry = 0; if (audioBc) audioBc.postMessage('playing'); }
     $('#bar').classList.remove('loading');
     if (p && fadeInMs) { Engine.fade(1, fadeInMs); fadeInMs = 0; }
     renderPlayState(p);
@@ -1589,6 +1620,8 @@
   function eqStatus() {
     const e = Engine.eng;
     if (!S.eq.on) return { cls: '', short: 'EQ nonaktif', html: 'EQ dimatikan.' };
+    if (Engine.ios) return { cls: '', short: 'EQ tidak dipakai di iPhone/iPad', html: 'Di iPhone/iPad lagu diputar tanpa EQ supaya tetap berjalan saat layar terkunci.' };
+    if (e === 'au' && Engine.noGraph()) return { cls: 'ok', short: 'Aktif · ' + S.eq.preset, html: '<b>EQ aktif.</b>' };
     if (live) return { cls: 'ok', short: 'EQ Live aktif · ' + S.eq.preset, html: `<b>EQ Live aktif.</b> Semua suara tab ini (YouTube, Spotify, radio) diproses EQ. <br><button class="btn sm" data-act="stopLive">Matikan EQ Live</button>` };
     if (Engine.hasFx()) return { cls: 'ok', short: 'Aktif · ' + S.eq.preset, html: '<b>EQ aktif.</b>' };
     if (e === 'au') return { cls: '', short: 'Stasiun ini mengunci audio — pakai EQ Live', html: `Stasiun ini tidak mengizinkan pemrosesan audio. <b>Aktifkan EQ Live</b> agar EQ tetap bekerja.<br><button class="btn sm pri" data-act="liveEq">${icon('eq')}Aktifkan EQ Live</button>` };
@@ -1759,8 +1792,11 @@
     h('previoustrack', prev);
     h('nexttrack', () => next(false));
     h('seekto', (d) => Engine.seek(d.seekTime));
-    h('seekbackward', () => Engine.seek(Math.max(0, Engine.time() - 10)));
-    h('seekforward', () => Engine.seek(Engine.time() + 10));
+    // iOS shows ±10 s buttons instead of previous/next on the lock screen when these two exist
+    if (!Engine.ios) {
+      h('seekbackward', () => Engine.seek(Math.max(0, Engine.time() - 10)));
+      h('seekforward', () => Engine.seek(Engine.time() + 10));
+    }
   }
   let PIP = null;
   async function openPip() {
@@ -1925,7 +1961,7 @@
   if (Q.list.length) { Q.i = Math.min(Q.i, Q.list.length - 1); renderNow(); }
   else renderPanel();
   // the first tap/click/key unlocks audio, so songs start by themselves even when their stream arrives later
-  for (const ev of ['pointerdown', 'keydown', 'touchend']) document.addEventListener(ev, () => Engine.unlock(), { capture: true, passive: true });
+  for (const ev of ['pointerdown', 'keydown', 'touchend', 'click']) document.addEventListener(ev, () => Engine.unlock(), { capture: true, passive: true });
   if (adFreeOn()) relay().then((ok) => { if (ok && Q.list.length) prefetchNext(true); });
   // lanjut otomatis: start by itself when the browser allows it, otherwise on the first touch anywhere
   (function armResume() {
