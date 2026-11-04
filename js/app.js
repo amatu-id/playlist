@@ -828,10 +828,10 @@
       let h = `<div class="v-bg"></div><div class="hero art"><div class="cv"${bg(hd.thumb)}></div><div><div class="kind">${icon('check')} Artis</div><h1>${esc(hd.title || '')}</h1><div class="desc">${esc(hd.desc || '')}</div></div></div>
         <div class="actions"><button class="playbtn lg" data-act="pcoll" data-ref="${ref}">${icon('play')}</button><button class="ib" data-act="pshuf" data-ref="${ref}" title="Putar acak">${icon('shuffle')}</button><button class="ib" data-act="radioArtist" title="Radio artis">${icon('radio')}</button><button class="ib" data-act="save" data-ref="${ref}" data-title="${esc(hd.title || '')}" data-thumb="${esc(hd.thumb || '')}" data-href="#artist/${esc(id)}" data-sub="Artis" title="Simpan">${icon(isSaved(ref) ? 'heartf' : 'heart')}</button></div>`;
       for (const s of d.sections) {
-        const tr = API.tracksOf(s.items);
+        const trs = API.tracksOf(s.items);
         const more = s.more && /^VL/.test(s.more) ? `<a href="#playlist/${esc(s.more)}">Lihat semua</a>` : '';
-        if (tr.length && s.items[0].type === 'song') h += `<section class="shelf"><div class="shelf-h"><h2>${esc(tr(s.title))}</h2>${more}</div>${trackList(tr, { name: hd.title, href: '#artist/' + id, ref }, { head: false })}</section>`;
-        else if (tr.length) h += shelf(s.title, songCards(tr, { name: hd.title, href: '#artist/' + id }), more);
+        if (trs.length && s.items[0].type === 'song') h += `<section class="shelf"><div class="shelf-h"><h2>${esc(tr(s.title))}</h2>${more}</div>${trackList(trs, { name: hd.title, href: '#artist/' + id, ref }, { head: false })}</section>`;
+        else if (trs.length) h += shelf(s.title, songCards(trs, { name: hd.title, href: '#artist/' + id }), more);
         else h += shelf(s.title, s.items.map((it) => card(cardFor(it))).join(''), more);
       }
       return h;

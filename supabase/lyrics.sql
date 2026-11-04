@@ -1,4 +1,4 @@
--- Lyrics written from a song's audio (Whisper): shared by every device, so they stay available with the MacBook off.
+-- Lyrics written from a song's audio: shared by every device, so they stay available with the MacBook off.
 -- First write wins; reading needs no session (the lines are not private), writing needs a portal session.
 begin;
 create table if not exists public.amt_lyrics (
