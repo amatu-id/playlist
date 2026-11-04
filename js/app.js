@@ -1412,8 +1412,8 @@
   $('#tTimer').onclick = (e) => openMenu([{ head: 'Timer tidur' }].concat([5, 15, 30, 45, 60, 90].map((m) => ({ label: m + ' menit', run: () => { sleep.at = Date.now() + m * 60000; sleep.end = false; renderSleep(); toast(`Musik berhenti dalam ${m} menit`); } })), [{ label: 'Akhir lagu ini', run: () => { sleep.end = true; sleep.at = 0; renderSleep(); toast('Berhenti setelah lagu ini'); } }, { label: 'Matikan timer', check: !sleep.at && !sleep.end, run: () => { sleep.at = 0; sleep.end = false; renderSleep(); } }]), e.currentTarget);
 
   // ---------------------------------------------------------------- lyrics
-  // lyric sites first, then lyrics already written from the audio (shared in the cloud, no MacBook needed); only a
-  // song nobody has written yet and a MacBook that is on makes the relay write them (Whisper) and share the result.
+  // lyric sites first, then lyrics already written from the audio (shared in the cloud). A song nobody has written yet
+  // goes to the cloud (edge fn amatu-lirik → Gemini, no MacBook needed); the relay's Whisper is the backup if that fails.
   // Lines not in Indonesian get an Indonesian translation underneath.
   const LY = { key: '', data: null, state: 'idle', tr: null };
   const LYC = new Map();   // track key → { data, tr } for this visit
@@ -1430,6 +1430,18 @@
     if (!AMT) return null;
     const d = await AMT.rpc('amt_lyrics_get', { p_id: id }).catch(() => null);
     return d && d.lines ? lyFromLines(t, d.lines) : null;
+  }
+  async function aiLyrics(t, id, k) {
+    if (!AMT || !rtoken() || t.sec > 900) return null;
+    const q = API.lyricQuery(t);
+    for (let i = 0; i < 6 && LY.key === k; i++) {
+      const r = await fetch(API.EDGE.replace('amatu-music', 'amatu-lirik') + '?' + new URLSearchParams({ id, t: q.title, ar: q.artist }), { headers: { 'x-amatu': rtoken() }, signal: AbortSignal.timeout(170e3) });
+      const j = await r.json().catch(() => ({}));
+      if (j.lines) return lyFromLines(t, j.lines);
+      if (!j.busy && !(/^gemini/.test(j.error || '') && i < 2)) return null;
+      await new Promise((ok) => setTimeout(ok, j.busy ? 20e3 : 45e3));   // another device is writing it / Gemini is overloaded
+    }
+    return null;
   }
   async function genLyrics(t, id) {
     const q = API.lyricQuery(t);
@@ -1455,9 +1467,13 @@
     if (!d && id) {
       d = await cloudLyrics(t, id);
       if (LY.key !== k) return;
+      if (!d) {
+        LY.state = 'gen'; refreshLyrics();
+        d = await aiLyrics(t, id, k).catch(() => null);
+        if (LY.key !== k) return;
+      }
       if (!d && (AMT || R.url) && (await relay())) {
         if (LY.key !== k) return;
-        LY.state = 'gen'; refreshLyrics();
         d = await genLyrics(t, id).catch(() => null);
         if (LY.key !== k) return;
       }
@@ -1484,7 +1500,7 @@
     const t = cur();
     if (!t) return empty('mic', 'Belum ada lagu');
     if (LY.state === 'loading') return loading();
-    if (LY.state === 'gen') return `<div class="load"><div class="spin"></div></div>` + empty('mic', 'Membuat lirik dari audio…', 'Belum ada di database lirik — server MacBook mendengarkan lagunya dan menuliskan liriknya (±15–30 detik).');
+    if (LY.state === 'gen') return `<div class="load"><div class="spin"></div></div>` + empty('mic', 'Membuat lirik dari audio…', 'Belum ada di database lirik — AI mendengarkan lagunya dan menuliskan liriknya (±30–60 detik, sekali saja untuk tiap lagu).');
     if (LY.state !== 'ok' || !LY.data) return empty('mic', t.src === 'radio' ? 'Lirik tidak tersedia untuk radio' : 'Lirik tidak ditemukan', t.src === 'radio' ? '' : t.src === 'file' ? 'File lokal tidak bisa dicarikan liriknya.' : 'Lagu ini belum ada di database lirik.');
     if (LY.data.instrumental) return empty('music', 'Instrumental', 'Lagu ini tanpa vokal.');
     const src = esc(LY.data.source || 'lrclib') + (LY.tr ? ' · terjemahan Indonesia' : '');
