@@ -87,6 +87,17 @@ window.Engine = (function () {
     if (p && p.then) p.then(done, () => { unlocked = false; done(); }); else done();
   }
 
+  // May this page start sound with no gesture? A silent clip must play and Web Audio must run, otherwise a song
+  // would look like it is playing while nothing is heard.
+  async function canAutoplay() {
+    try { const a = new Audio(SILENT); await a.play(); a.pause(); } catch (e) { return false; }
+    try {
+      fxInit();
+      if (au.ctx.state === 'suspended') await Promise.race([au.ctx.resume(), new Promise((r) => setTimeout(r, 400))]);
+      return au.ctx.state === 'running';
+    } catch (e) { return false; }
+  }
+
   // ---------- Spotify embed
   const sp = { api: null, ready: null, c: null, paused: true, pos: 0, dur: 0, auto: false, lastPos: 0 };
   function spInit() {
@@ -274,7 +285,7 @@ window.Engine = (function () {
   });
 
   return {
-    on, load, play: () => play(), pause, unlock, ytInit, playing, time, duration, buffered, seek, fade,
+    on, load, play: () => play(), pause, unlock, canAutoplay, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade,
     toggle() { playing() ? pause() : play(); },
     get eng() { return cur; },
     setVol(v) { vol = v; applyVol(); },

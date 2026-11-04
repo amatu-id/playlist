@@ -17,7 +17,7 @@
   const DEF = {
     v: 1, likes: [], lists: [], saved: [], hist: [], plays: {}, recentCtx: [], recent: [], match: {}, alt: {}, noAf: {},
     eq: JSON.parse(JSON.stringify(FX.DEF)), myPresets: {},
-    set: { spMode: 'yt', fade: 2, autoRadio: true, video: true, panel: true, ptab: 'np', adFree: true, floatLy: true },
+    set: { spMode: 'yt', fade: 2, autoRadio: true, video: true, panel: true, ptab: 'np', adFree: true, floatLy: true, autoResume: true },
     vol: 0.8, muted: false, rate: 1, shuffle: false, repeat: 0, listenSec: 0,
   };
   function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) || d; } catch (e) { return d; } }
@@ -29,6 +29,16 @@
   // the queue syncs to the account (written on changes only); the play position stays in this tab
   const saveQ = debounce(() => { try { localStorage.setItem(QKEY, JSON.stringify({ list: Q.list.filter((t) => t.src !== 'file'), i: Q.i, ctx: Q.ctx, orig: null })); } catch (e) { /* ignore */ } }, 600);
   try { Q.t = +sessionStorage.getItem('amatu.playlist.t') || 0; } catch (e) { Q.t = 0; }
+  // lanjut otomatis: song, second and "was it playing" of this device (pt.* keys never sync to the account)
+  const POS = 'pt.pl.pos', OTHER_TAB_MS = 12e3;
+  const readPos = () => { try { return JSON.parse(localStorage.getItem(POS)); } catch (e) { return null; } };
+  const otherTabPlays = (r) => !!(r && r.live && r.on && Date.now() - r.at < OTHER_TAB_MS);
+  let posOn = false, disarmResume = null;
+  // while a stream is still loading its time reads 0: keep the second it is about to start from
+  const posNow = () => (Engine.eng && !$('#bar').classList.contains('loading') ? Engine.time() : Q.t || 0);
+  function savePos(live) {
+    try { localStorage.setItem(POS, JSON.stringify({ k: curKey(), t: Math.floor(posNow()), on: Engine.wanted(), live: !!live, at: Date.now() })); } catch (e) { /* ignore */ }
+  }
 
   const key = (t) => t ? t.src + ':' + t.id : '';
   const lite = (t) => { const o = { src: t.src, id: t.id, title: t.title, artists: (t.artists || []).map((a) => (a.id ? { name: a.name, id: a.id } : { name: a.name })), sec: t.sec || 0, thumb: t.thumb || '' }; if (t.album) o.album = t.album; if (t.preview) o.preview = t.preview; if (t.kind) o.kind = t.kind; if (t.url && t.src === 'radio') o.url = t.url; return o; };
@@ -292,13 +302,13 @@
         const orig = t.src === 'yt' ? t.id : S.match[t.id];
         if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
         curSpec = { eng: 'au', url, ar: alt.id }; afFix = 0;
-        Engine.load(curSpec, { autoplay: true });
+        Engine.load(curSpec, { autoplay: true, start: Q.t > 1 ? Q.t : 0 });   // another upload carries on near the same second
         renderNow(); addHist(t); loadLyrics(t);
         return;
       }
       if (altTries === 1 && !R.ok && !C.ok) break;   // MacBook off and the cloud is down: other uploads won't help
     }
-    ytFallback(t, tok, 0);
+    ytFallback(t, tok, Q.t);
   }
   // warm the relay for the next songs so they start instantly
   function prefetchNext(withCur) {
@@ -336,7 +346,9 @@
     const t = cur();
     if (!t) return;
     const tok = ++playTok;
+    if (disarmResume) disarmResume();
     listened = 0; counted = false; fadingOut = false; altTries = 0; afFix = 0; tried.clear();
+    Q.t = opt.start || 0;
     renderNow(); saveQ();
     $('#bar').classList.add('loading');
     const spec = await specFor(t).catch(() => null);
@@ -1717,6 +1729,7 @@
       <div class="set-row"><div class="l"><b>Bebas iklan</b><span>Lagu YouTube diputar sebagai audio Hi-Fi tanpa iklan (EQ aktif) lewat server MacBook, atau server cloud saat MacBook mati. <i id="afSt">Memeriksa server…</i></span></div>${sw('adFree')}</div>
       <div class="set-row"><div class="l"><b>Lagu dari Spotify diputar via</b><span>Lagu penuh lewat YouTube, Spotify embed (lagu penuh bila login Spotify di browser), atau preview 30 dtk Hi-Fi dengan EQ.</span></div>${seg('spMode', [['yt', 'YouTube'], ['embed', 'Spotify'], ['preview', 'Preview']])}</div>
       <div class="set-row"><div class="l"><b>Transisi halus</b><span>Fade-in/out antar lagu (detik)</span></div>${seg('fade', [[0, 'Mati'], [2, '2'], [4, '4'], [6, '6'], [10, '10']])}</div>
+      <div class="set-row"><div class="l"><b>Lanjutkan otomatis</b><span>Saat situs dibuka, lagu terakhir lanjut di detik yang sama. Browser bisa meminta satu sentuhan dulu; lagu yang terakhir Anda jeda tidak dilanjutkan.</span></div>${sw('autoResume')}</div>
       <div class="set-row"><div class="l"><b>Autoplay lagu serupa</b><span>Saat antrean habis, lanjut otomatis dengan lagu mirip</span></div>${sw('autoRadio')}</div>
       <div class="set-row"><div class="l"><b>Tampilkan video musik</b><span>Video klip tampil otomatis; lagu audio menampilkan artwork (bisa diubah per lagu dengan tombol Video)</span></div>${sw('video')}</div>
       <div class="set-row"><div class="l"><b>Lirik mengambang</b><span>Lirik lagu yang diputar melayang di sepertiga kiri layar (layar lebar)</span></div>${sw('floatLy')}</div>
@@ -1882,13 +1895,14 @@
     updateFly(tm, d);
     if (PIP) { const i = PIP.document.querySelector('.pp i'); if (i) i.style.width = p * 100 + '%'; }
     if (!t || !Engine.eng) return;
+    if (Engine.wanted() !== posOn) { posOn = Engine.wanted(); savePos(posOn); }   // paused or resumed: remember at once
     syncLyrics(tm);
     if (Engine.playing()) {
       listened += dt; S.listenSec = (S.listenSec || 0) + dt;
       if (!counted && (listened >= 30 || (d && listened >= d * 0.5))) { counted = true; countPlay(t); }
       if (S.set.fade && d > 20 && !Engine.isLive() && !fadingOut && d - tm < S.set.fade && d - tm > 0.3 && S.repeat !== 2) { fadingOut = true; Engine.fade(0, (d - tm) * 1000); }
-      Q.t = tm;
-      if (now - lastSave > 5000) { lastSave = now; try { sessionStorage.setItem('amatu.playlist.t', String(Math.floor(tm))); } catch (e) { /* ignore */ } }
+      if (!$('#bar').classList.contains('loading')) Q.t = tm;
+      if (now - lastSave > 5000) { lastSave = now; savePos(true); try { sessionStorage.setItem('amatu.playlist.t', String(Math.floor(tm))); } catch (e) { /* ignore */ } }
       if ('mediaSession' in navigator && navigator.mediaSession.setPositionState && d && Math.abs(tm - lastPos) > 0.9) { lastPos = tm; try { navigator.mediaSession.setPositionState({ duration: d, position: Math.min(tm, d), playbackRate: S.rate }); } catch (e) { /* ignore */ } }
     }
     if (sleep.at) {
@@ -1929,6 +1943,44 @@
   // the first tap/click/key unlocks audio, so songs start by themselves even when their stream arrives later
   for (const ev of ['pointerdown', 'keydown', 'touchend']) document.addEventListener(ev, () => Engine.unlock(), { capture: true, passive: true });
   if (adFreeOn()) relay().then((ok) => { if (ok && Q.list.length) prefetchNext(true); });
+  // lanjut otomatis: start by itself when the browser allows it, otherwise on the first touch anywhere
+  (function armResume() {
+    const shared = location.hash.startsWith('#t=');
+    const r = readPos();
+    if (cur() && !shared && r) Q.t = r.k === curKey() ? r.t : 0;
+    if (Q.list.length) renderNow();
+    if (!S.set.autoResume || !cur() || shared || (r && !r.on) || otherTabPlays(r)) return;
+    const hint = $('#rsm'), tok = playTok;
+    const go = () => {
+      if (!disarmResume) return;
+      disarmResume();
+      if (tok !== playTok || Engine.eng || !S.set.autoResume || otherTabPlays(readPos())) return;
+      startCur({ start: cur().src === 'radio' ? 0 : Q.t || 0 });
+    };
+    const onClick = (e) => {
+      if (e.target.closest && e.target.closest('.pb, .playbtn, [data-act="play"]')) { disarmResume(); return; }   // the user picked a song
+      setTimeout(go, 0);   // after the page's own handlers, which may already have started something
+    };
+    const onKey = (e) => {
+      const tag = (e.target.tagName || '').toLowerCase();
+      if (e.metaKey || e.ctrlKey || e.altKey || e.key === 'Tab' || e.key === 'Escape' || e.key === 'Shift' || tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
+      setTimeout(go, 0);
+    };
+    disarmResume = () => {
+      disarmResume = null; hint.hidden = true;
+      document.removeEventListener('click', onClick, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+    document.addEventListener('click', onClick, true);
+    document.addEventListener('keydown', onKey, true);
+    $('#rsmX').onclick = (e) => { e.stopPropagation(); if (disarmResume) disarmResume(); };
+    Engine.canAutoplay().then((ok) => {
+      if (!disarmResume) return;
+      if (ok) return go();
+      $('#rsmT').textContent = cur().title;
+      hint.hidden = false;
+    });
+  })();
   // hovering (or pressing) a song warms its ad-free stream, so the click starts it sooner
   let hoverT = 0;
   const warm = (e) => {
@@ -1944,7 +1996,10 @@
   Engine.ytInit().catch(() => { /* loads again on first YouTube song */ });
   setInterval(() => { if (adFreeOn() && !R.ok && document.visibilityState === 'visible') relay(); }, 60e3);
   window.addEventListener('resize', debounce(() => { dockKey = ''; }, 100));
-  window.addEventListener('pagehide', () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* ignore */ } });
+  window.addEventListener('pagehide', () => {
+    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* ignore */ }
+    if (Engine.eng && cur()) savePos(false);   // left this tab: a reload may resume, it is not "another tab playing"
+  });
   window.addEventListener('storage', (e) => {
     // amatu.js pulled newer data from another device
     if (e.key === KEY && e.newValue) { try { const n = JSON.parse(e.newValue); for (const k of ['likes', 'lists', 'saved', 'myPresets']) if (n[k]) S[k] = n[k]; renderSideLists(); } catch (err) { /* ignore */ } }

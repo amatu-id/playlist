@@ -417,6 +417,12 @@ h1.v-title { font-size: 30px; letter-spacing: -.6px; margin: 4px 0 18px; font-we
 .seg { display: inline-flex; background: var(--s3); border-radius: 8px; padding: 3px; gap: 2px; }
 .seg button { padding: 5px 10px; border-radius: 6px; font-size: 12.5px; font-weight: 700; color: var(--mut); }
 .seg button.on { background: var(--tx); color: #000; }
+#rsm { position: fixed; z-index: 30; left: 50%; bottom: calc(var(--barH) + 18px); transform: translateX(-50%); display: flex; align-items: center; gap: 10px; max-width: min(560px, calc(100vw - 24px)); padding: 6px 6px 6px 14px; background: var(--s2); color: var(--tx); border: 1px solid var(--line); border-radius: 999px; box-shadow: 0 10px 30px #0009; animation: tin .2s ease; }
+#rsm[hidden] { display: none; }
+#rsm > svg { flex: none; width: 16px; height: 16px; fill: var(--ac); }
+#rsm > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; }
+#rsm i { font-style: normal; color: var(--mut); }
+#rsm .ib { flex: none; }
 #toasts { position: fixed; z-index: 100; left: 50%; bottom: calc(var(--barH) + 18px); transform: translateX(-50%); display: grid; gap: 8px; justify-items: center; pointer-events: none; }
 .toast { background: #2f80ed; color: #fff; padding: 10px 18px; border-radius: 8px; font-weight: 650; box-shadow: 0 10px 30px #0009; animation: tin .2s ease; max-width: 90vw; text-align: center; }
 .toast.ok { background: #e8ebf0; color: #000; }
@@ -481,6 +487,7 @@ body.dragging .dropzone { border-color: var(--ac); color: var(--tx); }
   #tabbar a.on { color: var(--tx); }
   #tabbar svg { width: 24px; height: 24px; }
   #toasts { bottom: calc(var(--barH) + var(--tabH) + 12px); }
+  #rsm { bottom: calc(var(--barH) + var(--tabH) + 12px); }
   .hero { flex-direction: column; align-items: center; text-align: center; gap: 14px; }
   .hero .cv { width: 200px; height: 200px; }
   .hero h1 { font-size: 30px; letter-spacing: -.6px; }
