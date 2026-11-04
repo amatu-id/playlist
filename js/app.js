@@ -932,7 +932,7 @@
       if (tok !== rtok) return null;
       if (!st.length) return h + empty('radio', 'Stasiun tidak ditemukan', 'Server radio sedang sibuk, coba lagi.');
       const lid = regList(st, { name: 'Radio', href: '#radio' });
-      return h + `<div class="note" style="margin-bottom:16px">${icon('eq')} Radio diputar lewat mesin Hi-Fi: EQ bekerja langsung bila stasiun mengizinkan; jika tidak, aktifkan <b>EQ Live</b>.</div><div class="grid">${st.map((s, i) => `<div class="card" data-l="${lid}" data-i="${i}"><div class="cv" style="display:grid;place-items:center;background:#1c2029;color:var(--dim)">${icon('radio')}${s.thumb ? `<img src="${esc(s.thumb)}" alt="" loading="lazy" style="position:absolute;inset:19%;width:62%;height:62%;object-fit:contain" onerror="this.remove()">` : ''}<button class="pb" data-act="ps">${icon('play')}</button></div><div class="t">${esc(s.title)}</div><div class="s">${esc(s.artists[0].name)}${s.br ? ' · ' + s.br + ' kbps' : ''}</div></div>`).join('')}</div>`;
+      return h + `<div class="grid">${st.map((s, i) => `<div class="card" data-l="${lid}" data-i="${i}"><div class="cv" style="display:grid;place-items:center;background:#1c2029;color:var(--dim)">${icon('radio')}${s.thumb ? `<img src="${esc(s.thumb)}" alt="" loading="lazy" style="position:absolute;inset:19%;width:62%;height:62%;object-fit:contain" onerror="this.remove()">` : ''}<button class="pb" data-act="ps">${icon('play')}</button></div><div class="t">${esc(s.title)}</div><div class="s">${esc(s.artists[0].name)}${s.br ? ' · ' + s.br + ' kbps' : ''}</div></div>`).join('')}</div>`;
     },
   };
 
@@ -953,7 +953,7 @@
     const info = { title: hd.title, thumb: hd.thumb, href, sub: kind === 'album' ? 'Album' : 'Playlist' };
     let h = `<div class="v-bg"></div><div class="hero"><div class="cv"${bg(hd.thumb)}></div><div><div class="kind">${kindLbl}</div><h1 class="${(hd.title || '').length > 24 ? 'long' : ''}">${esc(hd.title || '')}</h1>${hd.desc ? `<div class="desc">${esc(hd.desc)}</div>` : ''}<div class="meta">${meta}</div></div></div>
       <div class="actions"><button class="playbtn lg" data-act="pcoll" data-ref="${esc(ref)}">${icon(Q.ctx && Q.ctx.ref === ref && Engine.playing() ? 'pause' : 'play')}</button><button class="ib" data-act="pshuf" data-ref="${esc(ref)}" title="Putar acak">${icon('shuffle')}</button><button class="ib${isSaved(ref) ? ' on' : ''}" data-act="save" data-ref="${esc(ref)}" data-title="${esc(info.title || '')}" data-thumb="${esc(info.thumb || '')}" data-href="${esc(href)}" data-sub="${esc(info.sub)}" title="Simpan ke Pustaka">${icon(isSaved(ref) ? 'heartf' : 'heart')}</button><button class="ib" data-act="moreColl" data-ref="${esc(ref)}" data-title="${esc(info.title || '')}" data-thumb="${esc(info.thumb || '')}" data-href="${esc(href)}" title="Opsi">${icon('more')}</button>
-      ${kind === 'sp' ? `<span class="note" style="padding:6px 12px">${icon('sp')} Diputar via <b>${{ yt: 'YouTube (lagu penuh)', embed: 'Spotify embed', preview: 'Preview Hi-Fi 30 dtk' }[S.set.spMode]}</b> · <a href="#" data-act="settings" style="text-decoration:underline">ubah</a></span>` : ''}</div>`;
+      </div>`;
     h += tracks.length ? trackList(tracks, { name: hd.title, href, ref, thumb: hd.thumb }) : empty('music', 'Tidak ada lagu');
     for (const s of d.sections.slice(1)) if (s.items.length) h += `<div style="margin-top:30px"></div>` + shelf(s.title || 'Lainnya', s.items.map((it) => card(cardFor(it))).join(''));
     return h;
@@ -1232,18 +1232,6 @@
     const k = curKey();
     $$('.tr').forEach((r) => r.classList.toggle('cur', r.dataset.k === k));
   }
-  function srcLabel() {
-    const t = cur(), e = Engine.eng;
-    if (!t) return ['', ''];
-    if (t.src === 'radio') return ['hf', 'RADIO'];
-    if (t.src === 'file') return ['hf', 'HI-FI'];
-    if (e === 'au' && curSpec && curSpec.ar) return ['hf', 'BEBAS IKLAN · HI-FI'];
-    if (!e && adFreeOn() && (t.src === 'yt' || t.src === 'sp')) return ['hf', 'BEBAS IKLAN · MEMUAT'];
-    if (e === 'au') return ['hf', 'HI-FI · PREVIEW'];
-    if (e === 'sp') return ['sp', 'SPOTIFY'];
-    if (t.src === 'sp') return ['yt', 'SPOTIFY → YT'];
-    return ['yt', t.kind === 'video' ? 'YOUTUBE' : 'YT MUSIC'];
-  }
   let lastTintFor = '';
   function renderNow() {
     const t = cur();
@@ -1258,8 +1246,6 @@
     $('#fArt').style.backgroundRepeat = $('#bArt').style.backgroundRepeat = 'no-repeat';
     $('#fBg').style.backgroundImage = t && t.thumb ? `url("${t.thumb}")` : '';
     $('#fCtx').textContent = Q.ctx ? 'Diputar dari · ' + Q.ctx.name : 'Sedang diputar';
-    const [cls, lbl] = srcLabel();
-    const sb = $('#srcBadge'); sb.className = 'src-badge' + (lbl ? ' show ' + cls : ''); sb.textContent = lbl;
     document.title = t ? `${t.title} · ${artistsText(t)} — Amatu Playlist` : 'Amatu Playlist';
     const live = Engine.isLive() || (t && t.src === 'radio');
     $('#seek').classList.toggle('dis', !!live); $('#fSeek').classList.toggle('dis', !!live);
@@ -1330,7 +1316,7 @@
       ${Engine.eng === 'sp' ? '<div class="spslot" id="pSpSlot" style="height:152px"></div>' : ''}
       <div class="np-row"><div style="min-width:0"><div class="np-t">${esc(t.title)}</div><div class="np-a">${arts(t)}</div></div>${t.src === 'file' || t.src === 'radio' ? '' : `<button class="ib like${liked(t) ? ' on' : ''}" data-act="np-like">${icon(liked(t) ? 'heartf' : 'heart')}</button>`}</div>
       <div class="chips" style="margin:0">${t.src !== 'file' && t.src !== 'radio' ? `<button class="chip" data-act="np-radio">${icon('radio')}Radio lagu</button>` : ''}${Engine.eng === 'yt' ? `<button class="chip${vid ? ' on' : ''}" data-act="np-video">${icon('video')}Video</button>` : ''}${t.src === 'yt' || t.src === 'sp' ? `<button class="chip" data-act="np-ext">${icon(t.src === 'yt' ? 'yt' : 'sp')}Buka</button><button class="chip" data-act="np-share">${icon('share')}Bagikan</button>` : ''}</div>
-      ${t.album || t.sec ? `<div class="np-box"><h4>Info lagu</h4><div style="color:var(--mut);font-size:13px;display:grid;gap:4px">${t.album ? `<div>Album: ${t.album.id ? `<a href="#album/${esc(t.album.id)}" style="color:var(--tx)">${esc(t.album.name)}</a>` : esc(t.album.name)}</div>` : ''}${t.sec ? `<div>Durasi: ${fmt(t.sec)}</div>` : ''}<div>Sumber: ${srcLabel()[1]}</div></div></div>` : ''}
+      ${t.album || t.sec ? `<div class="np-box"><h4>Info lagu</h4><div style="color:var(--mut);font-size:13px;display:grid;gap:4px">${t.album ? `<div>Album: ${t.album.id ? `<a href="#album/${esc(t.album.id)}" style="color:var(--tx)">${esc(t.album.name)}</a>` : esc(t.album.name)}</div>` : ''}${t.sec ? `<div>Durasi: ${fmt(t.sec)}</div>` : ''}</div></div>` : ''}
       ${nexts.length ? `<div class="np-box"><h4>Berikutnya di antrean <button data-tabgo="queue">Buka antrean</button></h4>${nexts.map((x, j) => miniRow(x, Q.i + 1 + j)).join('')}</div>` : ''}
       <div class="np-box"><h4>Equalizer <button data-tabgo="eq">Atur</button></h4><div style="color:var(--mut);font-size:13px">${esc(eqStatus().short)}</div></div>
     </div>`;
@@ -1512,13 +1498,11 @@
     const t = cur();
     if (!t) return empty('mic', 'Belum ada lagu');
     if (LY.state === 'loading') return loading();
-    if (LY.state === 'gen') return `<div class="load"><div class="spin"></div></div>` + empty('mic', 'Membuat lirik dari audio…', 'Belum ada di database lirik — AI mendengarkan lagunya dan menuliskan liriknya (±30–60 detik, sekali saja untuk tiap lagu).');
-    if (LY.state !== 'ok' || !LY.data) return empty('mic', t.src === 'radio' ? 'Lirik tidak tersedia untuk radio' : 'Lirik tidak ditemukan', t.src === 'radio' ? '' : t.src === 'file' ? 'File lokal tidak bisa dicarikan liriknya.' : 'Lagu ini belum ada di database lirik.');
+    if (LY.state === 'gen') return `<div class="load"><div class="spin"></div></div>` + empty('mic', 'Membuat lirik…', '');
+    if (LY.state !== 'ok' || !LY.data) return empty('mic', t.src === 'radio' ? 'Lirik tidak tersedia untuk radio' : 'Lirik tidak ditemukan', t.src === 'radio' ? '' : '');
     if (LY.data.instrumental) return empty('music', 'Instrumental', 'Lagu ini tanpa vokal.');
-    const src = esc(LY.data.source || 'lrclib') + (LY.tr ? ' · terjemahan Indonesia' : '');
-    const note = LY.data.gen ? '<div class="ly-note">Dibuat otomatis dari suara lagu — bisa ada kata yang kurang tepat.</div>' : '';
-    if (LY.data.synced) return `<div class="lyr-h"><span>Lirik sinkron · ${src}</span><span class="off">Sinkron <button data-act="ly-off" data-d="-0.5">−</button><b class="lyo">${lyOff > 0 ? '+' : ''}${lyOff}s</b><button data-act="ly-off" data-d="0.5">+</button></span></div>${note}<div class="lyr">${LY.data.synced.map((l, i) => `<p data-ly="${i}">${esc(l.x || '♪')}${lyTr(i)}</p>`).join('')}</div>`;
-    return `<div class="lyr-h"><span>Lirik · ${src}</span></div>${note}<div class="lyr plain">${LY.data.plain.split('\n').map((l, i) => `<p>${esc(l) || '&nbsp;'}${lyTr(i)}</p>`).join('')}</div>`;
+    if (LY.data.synced) return `<div class="lyr-h"><span></span><span class="off">Sinkron <button data-act="ly-off" data-d="-0.5">−</button><b class="lyo">${lyOff > 0 ? '+' : ''}${lyOff}s</b><button data-act="ly-off" data-d="0.5">+</button></span></div><div class="lyr">${LY.data.synced.map((l, i) => `<p data-ly="${i}">${esc(l.x || '♪')}${lyTr(i)}</p>`).join('')}</div>`;
+    return `<div class="lyr plain">${LY.data.plain.split('\n').map((l, i) => `<p>${esc(l) || '&nbsp;'}${lyTr(i)}</p>`).join('')}</div>`;
   }
   function renderLyricsHead() { $$('.lyo').forEach((b) => { b.textContent = (lyOff > 0 ? '+' : '') + lyOff + 's'; }); lyLast = -2; }
   document.addEventListener('click', (e) => {
@@ -1603,10 +1587,10 @@
     for (const u of eqUIs) u.sync();
   }
   function eqStatus() {
-    const e = Engine.eng, t = cur();
+    const e = Engine.eng;
     if (!S.eq.on) return { cls: '', short: 'EQ nonaktif', html: 'EQ dimatikan.' };
     if (live) return { cls: 'ok', short: 'EQ Live aktif · ' + S.eq.preset, html: `<b>EQ Live aktif.</b> Semua suara tab ini (YouTube, Spotify, radio) diproses EQ. <br><button class="btn sm" data-act="stopLive">Matikan EQ Live</button>` };
-    if (Engine.hasFx()) return { cls: 'ok', short: 'Aktif pada audio Hi-Fi · ' + S.eq.preset, html: `<b>EQ aktif</b> pada audio Hi-Fi ini${t && t.src === 'radio' ? ' (radio)' : ''}.` };
+    if (Engine.hasFx()) return { cls: 'ok', short: 'Aktif · ' + S.eq.preset, html: '<b>EQ aktif.</b>' };
     if (e === 'au') return { cls: '', short: 'Stasiun ini mengunci audio — pakai EQ Live', html: `Stasiun ini tidak mengizinkan pemrosesan audio. <b>Aktifkan EQ Live</b> agar EQ tetap bekerja.<br><button class="btn sm pri" data-act="liveEq">${icon('eq')}Aktifkan EQ Live</button>` };
     return { cls: '', short: (e === 'sp' ? 'Spotify' : 'YouTube') + ': aktifkan EQ Live agar EQ terdengar', html: `Lagu ${e === 'sp' ? 'Spotify' : 'YouTube'} diputar di pemutar resmi yang dikunci browser. Aktifkan <b>EQ Live</b> (Chrome/Edge di komputer) supaya EQ ini juga mengolah lagunya.<br><button class="btn sm pri" data-act="liveEq">${icon('eq')}Aktifkan EQ Live</button><div style="margin-top:6px">EQ langsung aktif tanpa EQ Live untuk: Radio, File lokal, Preview Hi-Fi.</div>` };
   }

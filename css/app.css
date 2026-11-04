@@ -234,11 +234,6 @@ h1.v-title { font-size: 30px; letter-spacing: -.6px; margin: 4px 0 18px; font-we
 .b-r .ib svg { width: 18px; height: 18px; }
 .vol { display: flex; align-items: center; gap: 4px; }
 .vol .range { width: 96px; }
-.src-badge { font-size: 10.5px; font-weight: 800; letter-spacing: .04em; padding: 3px 7px; border-radius: 6px; margin-right: 6px; white-space: nowrap; display: none; }
-.src-badge.show { display: inline-block; }
-.src-badge.yt { background: #ff3d3d22; color: #ff7676; }
-.src-badge.sp { background: #1ed76022; color: #1ed760; }
-.src-badge.hf { background: #4cc9f022; color: #6fd6ff; }
 .m-prog { display: none; }
 
 /* custom range */
@@ -304,7 +299,6 @@ h1.v-title { font-size: 30px; letter-spacing: -.6px; margin: 4px 0 18px; font-we
 .lyr.plain p { color: #ffffffd0; cursor: default; }
 .lyr p .ly-tr { display: block; margin-top: 3px; font-size: .6em; font-weight: 600; font-style: italic; letter-spacing: 0; line-height: 1.3; opacity: .78; }
 .lyr p.now .ly-tr { opacity: .9; }
-.ly-note { margin: 2px 0 6px; font-size: 11.5px; color: var(--mut); }
 .lyr-h { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 4px; font-size: 12px; color: var(--mut); }
 .lyr-h .off { display: flex; gap: 4px; align-items: center; }
 .lyr-h .off button { background: #ffffff12; border-radius: 6px; padding: 2px 8px; font-weight: 700; }
