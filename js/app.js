@@ -169,7 +169,7 @@
   }
 
   // ---------------------------------------------------------------- playback core
-  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0;
+  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0, failRun = 0;
   const tried = new Set();
 
   // ---------------------------------------------------------------- ad-free audio (runs entirely from the web)
@@ -197,16 +197,32 @@
     C.list = [...new Set([...INV, ...l])].slice(0, 8); C.at = Date.now();
     return C.list;
   }
+  // what each video's stream is made of: length + the formats the silence scan can read
+  const VM = new Map();
+  async function askHost(h, id, ms) {
+    const r = await fetch(`${h}/api/v1/videos/${encodeURIComponent(id)}?local=true&fields=adaptiveFormats,lengthSeconds`, { signal: AbortSignal.timeout(ms) });
+    const d = await r.json();
+    const fm = (d.adaptiveFormats || []).filter((f) => /^audio\/mp4/.test(f.type || '') && f.url);
+    const f = fm.find((f) => String(f.itag) === '140') || fm.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    if (!f) throw new Error('no audio');
+    const abs = (x) => new URL(x.url, h).href, small = fm.find((f) => String(f.itag) === '139' && f.index) || f;
+    VM.set(id, { sec: +d.lengthSeconds || 0, scan: small.index ? { url: abs(small), init: small.init, index: small.index } : null });
+    if (VM.size > 300) VM.delete(VM.keys().next().value);
+    return { h, url: abs(f) };
+  }
+  // the server that worked last, then all the others at once: a dead server must not keep the music waiting
   async function cloudUrl(id) {
-    const l = await invList();
-    for (const h of C.ok ? [C.ok, ...l.filter((x) => x !== C.ok)] : l) {
-      try {
-        const r = await fetch(`${h}/api/v1/videos/${encodeURIComponent(id)}?local=true&fields=adaptiveFormats`, { signal: AbortSignal.timeout(9000) });
-        const fm = ((await r.json()).adaptiveFormats || []).filter((f) => /^audio\/mp4/.test(f.type || '') && f.url);
-        const f = fm.find((f) => String(f.itag) === '140') || fm.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-        if (f) { C.ok = h; C.failAt = 0; return new URL(f.url, h).href; }
-      } catch (e) { /* next instance */ }
-    }
+    const l = await invList(), first = C.ok || l[0];
+    try {
+      const a = await askHost(first, id, 7000);
+      C.ok = a.h; C.failAt = 0;
+      return a.url;
+    } catch (e) { /* the others */ }
+    try {
+      const a = await Promise.any(l.filter((h) => h !== first).map((h) => askHost(h, id, 7000)));
+      C.ok = a.h; C.failAt = 0;
+      return a.url;
+    } catch (e) { /* none */ }
     if (C.ok && l.length) C.ok = null;
     C.failAt = Date.now();
     throw new Error('cloud');
@@ -227,8 +243,11 @@
   async function ytSpec(t, id) {
     if (!adFreeOn() || wantsVideo(t)) return { eng: 'yt', id };
     const url = await adFreeUrl(id);
+    if (url && id !== t.id && tooLong(id, t)) return { eng: 'af', ar: id };
     return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id };
   }
+  // another upload of a song may be an extended version, a medley or a video with a long empty end
+  const tooLong = (id, t) => { const m = VM.get(id), sec = m && m.sec; return !!sec && (t.sec ? sec > t.sec * 1.4 + 20 : sec > 540); };
   // nothing ad-free answers: the YouTube player keeps the music going (it may show ads)
   let ytFbAt = 0, bgRetry = 0;
   function ytFallback(t, tok, at) {
@@ -246,7 +265,7 @@
     ytFbAt = Date.now();
     curSpec = { eng: 'yt', id }; altTries = 3;
     Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }).then(() => { if (tok === playTok) $('#bar').classList.remove('loading'); }, () => {});
-    renderNow();
+    renderNow(); scanSong(tok);
     if (!at) { addHist(t); loadLyrics(t); }
   }
   // no source can fetch this upload → another upload of the same song, still ad-free
@@ -255,23 +274,63 @@
       altTries++;
       const d = await API.search(`${t.title} ${artistsText(t)}`, altTries === 1 ? 'songs' : 'videos').catch(() => null);
       if (tok !== playTok) return;
-      const alt = d && API.tracksOf(d.items).find((x) => !tried.has(x.id));
-      if (!alt) continue;
-      tried.add(alt.id);
-      const url = await adFreeUrl(alt.id, true);
-      if (tok !== playTok) return;
-      if (url) {
+      const cands = d ? API.tracksOf(d.items).filter((x) => !tried.has(x.id)).slice(0, 4) : [];
+      for (const alt of cands) {
+        tried.add(alt.id);
+        const url = await adFreeUrl(alt.id, true);
+        if (tok !== playTok) return;
+        if (!url && !C.ok) break;   // the servers are down: other uploads won't help
+        if (!url || tooLong(alt.id, t)) continue;
         const orig = t.src === 'yt' ? t.id : S.match[t.id];
         if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
         curSpec = { eng: 'au', url, ar: alt.id }; afFix = 0;
         Engine.load(curSpec, { autoplay: true, start: Q.t > 1 ? Q.t : 0 });   // another upload carries on near the same second
-        renderNow(); addHist(t); loadLyrics(t);
+        renderNow(); addHist(t); loadLyrics(t); scanSong(tok);
         return;
       }
-      if (altTries === 1 && !C.ok) break;   // the servers are down: other uploads won't help
+      if (cands.length && !C.ok) break;
     }
     ytFallback(t, tok, Q.t);
   }
+  // ---------------------------------------------------------------- silence inside the stream
+  const GAPS = new Map();
+  let scanAbort = null;
+  const curVid = () => curSpec && (curSpec.ar || curSpec.id) || '';
+  async function scanSong(tok) {
+    const id = curVid();
+    if (!id || curSpec.live) return;
+    if (scanAbort) scanAbort.abort();
+    if (GAPS.has(id)) { Engine.setPlan(GAPS.get(id)); return; }
+    scanAbort = new AbortController();
+    try {
+      if (!VM.has(id)) await adFreeUrl(id);
+      const m = VM.get(id);
+      if (!m || !m.scan || tok !== playTok) return;
+      const p = await Gap.scan(m.scan, scanAbort.signal);
+      GAPS.set(id, p);
+      if (GAPS.size > 300) GAPS.delete(GAPS.keys().next().value);
+      if (tok === playTok && curVid() === id) { Engine.setPlan(p); renderNow(); }
+    } catch (e) { /* no scan: the live checks still apply */ }
+  }
+  // The output stayed silent for seconds. Stream silent too → jump to the next sound or the next song; stream has
+  // sound here → the fault is the audio path, so play without it at the same second.
+  let silentBusy = false;
+  Engine.on('silent', async (at) => {
+    const id = curVid(), tok = playTok;
+    if (silentBusy || !id) return;
+    silentBusy = true;
+    try {
+      if (!VM.has(id)) await adFreeUrl(id);
+      const m = VM.get(id);
+      const r = m && m.scan ? await Gap.ahead(m.scan, at) : null;
+      if (tok !== playTok) return;
+      if (!r) return;
+      if (r.now) Engine.useRaw();
+      else if (r.over) Engine.finish();
+      else Engine.seek(r.at);
+    } catch (e) { /* stream unreadable: leave the song playing */ }
+    finally { silentBusy = false; }
+  });
   const cloudDown = () => Date.now() - C.failAt < 60e3;
   // look up the next songs early so they start instantly
   const warmId = (t) => (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
@@ -281,6 +340,18 @@
       const id = warmId(t);
       if (id) adFreeUrl(id);
     }
+  }
+  // the last half minute of a song: buffer the next one, it starts the moment this one ends
+  let spareFor = 0;
+  async function readySpare() {
+    spareFor = playTok;
+    if (!adFreeOn() || S.repeat === 2) return;
+    const tok = playTok, k = curKey();
+    const nx = Q.list[Q.i + 1] || (ahead && ahead.k === k && ahead.list[0]) || (!S.set.autoRadio || S.repeat === 1 ? Q.list[0] : null);
+    const id = nx && nx.src !== 'radio' && !wantsVideo(nx) && warmId(nx);
+    if (!id) return;
+    const url = await adFreeUrl(id);
+    if (url && tok === playTok && !tooLong(id, nx)) Engine.preload(url);
   }
   // last song of the queue: find what plays after it now, while it is still playing. On a locked phone the lookup
   // after the song ended may never finish. Kept aside so the visible queue and "add to queue" don't change.
@@ -323,6 +394,7 @@
     const t = cur();
     if (!t) return;
     const tok = ++playTok;
+    fadeInMs = 0;
     if (disarmResume) disarmResume();
     listened = 0; counted = false; fadingOut = false; altTries = 0; afFix = 0; tried.clear();
     Q.t = opt.start || 0;
@@ -342,14 +414,16 @@
     if (spec.id) tried.add(spec.id);
     const fade = S.set.fade && opt.autoplay !== false && !spec.live;
     Engine.fade(fade ? 0 : 1, 0);
-    try { await Engine.load(spec, { start: opt.start || 0, autoplay: opt.autoplay !== false }); }
+    // armed before the song starts: its 'playing' event comes first, and a fade-in set after it would leave seconds of silence
+    if (fade) { fadeInMs = Math.min(2500, S.set.fade * 700); setTimeout(() => { if (tok === playTok && fadeInMs) { Engine.fade(1, fadeInMs); fadeInMs = 0; } }, 4000); }
+    try { await Engine.load(spec, { start: opt.start || 0, autoplay: opt.autoplay !== false, keepFade: true }); }
     catch (e) { toast(e.message || 'Gagal memuat pemutar', 'err'); return; }
     if (tok !== playTok) return;
     $('#bar').classList.remove('loading');
-    if (fade) { fadeInMs = Math.min(2500, S.set.fade * 700); setTimeout(() => { if (tok === playTok && fadeInMs) { Engine.fade(1, fadeInMs); fadeInMs = 0; } }, 4000); }
     if (opt.autoplay !== false) addHist(t);
     renderNow();
     loadLyrics(t);
+    scanSong(tok);
     setTimeout(() => { if (tok === playTok) { prefetchNext(); warmRadio(); } }, 2500);
   }
 
@@ -406,11 +480,11 @@
         toast('Autoplay: memutar lagu serupa');
         return startCur();
       }
-      // no similar songs reachable: keep the music going from the top of the queue instead of stopping
-      if (auto && Q.list.length > 1) { Q.i = 0; toast('Autoplay: mengulang antrean'); return startCur(); }
     }
-    Engine.pause(); Engine.fade(1, 0);
-    if (auto) Engine.seek(0);
+    // nothing similar to add: start the queue again, even a single song, the music does not stop by itself
+    Q.i = 0;
+    if (Q.list.length > 1) toast('Mengulang antrean');
+    return startCur();
   }
   async function prev() {
     if (Engine.time() > 4 || Q.i === 0) { Engine.seek(0); return; }
@@ -461,7 +535,7 @@
     const tok = playTok;
     if (err.eng === 'au' && curSpec && curSpec.ar) {
       // stream broke or its link expired → same song, same spot
-      const id = curSpec.ar, at = Engine.time();
+      const id = curSpec.ar, at = Engine.time() || Q.t || 0;
       if (afFix++ < 3) {
         const url = await adFreeUrl(id, true);
         if (tok !== playTok) return;
@@ -476,18 +550,20 @@
       const q = `${t.title} ${artistsText(t)}`;
       const d = await API.search(q, altTries === 1 ? 'songs' : 'videos').catch(() => null);
       if (tok !== playTok) return;
-      const alt = d && API.tracksOf(d.items).find((x) => !tried.has(x.id));
+      const alt = d && API.tracksOf(d.items).find((x) => !tried.has(x.id) && !tooLong(x.id, t));
       if (alt) {
         tried.add(alt.id);
         const orig = t.src === 'yt' ? t.id : S.match[t.id];
         if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
         curSpec = { eng: 'yt', id: alt.id };
         Engine.load(curSpec, { autoplay: true });
+        scanSong(tok);
         return;
       }
     }
     toast('Tidak dapat memutar "' + t.title + '" — lanjut', 'err');
-    setTimeout(() => { if (tok === playTok) next(true); }, 1200);
+    // nothing plays (no internet?): keep trying, but not through the queue at full speed
+    setTimeout(() => { if (tok === playTok) next(true); }, ++failRun > 5 ? 15e3 : 1200);
   });
   Engine.on('end', () => {
     if (S.repeat === 2) { Engine.seek(0); Engine.play(); return; }
@@ -496,12 +572,24 @@
   // other Amatu tabs drop their silent keep-alive (amatu.js) while a song plays here
   const audioBc = 'BroadcastChannel' in window ? new BroadcastChannel('amatu-audio') : null;
   Engine.on('state', (p) => {
-    if (p) { bgRetry = 0; if (audioBc) audioBc.postMessage('playing'); }
+    if (p) { bgRetry = 0; failRun = 0; $('#rsm').hidden = true; if (audioBc) audioBc.postMessage('playing'); }
     $('#bar').classList.remove('loading');
     if (p && fadeInMs) { Engine.fade(1, fadeInMs); fadeInMs = 0; }
     renderPlayState(p);
   });
-  Engine.on('engine', () => { renderNow(); });
+  Engine.on('engine', () => { Engine.setPlan(GAPS.get(curVid()) || null); renderNow(); });
+  // the browser refused to start sound: the song stays wanted and starts on the first touch (the watchdog retries)
+  Engine.on('blocked', () => {
+    if (!cur()) return;
+    const hint = $('#rsm');
+    $('#rsmT').textContent = cur().title;
+    hint.hidden = false;
+    const off = () => { document.removeEventListener('click', go, true); document.removeEventListener('keydown', go, true); hint.hidden = true; };
+    const go = (e) => { if (e.target.closest && e.target.closest('#rsmX')) return; off(); if (Engine.wanted() && !Engine.playing()) Engine.play(); };
+    document.addEventListener('click', go, true);
+    document.addEventListener('keydown', go, true);
+    $('#rsmX').onclick = (e) => { e.stopPropagation(); off(); Engine.pause(); };
+  });
   Engine.on('fx', () => { if (activeTab() === 'eq') renderPanel(); });
 
   function addHist(t) {
@@ -1720,8 +1808,8 @@
       <div class="set-row"><div class="l"><b>Bebas iklan</b><span>Lagu YouTube diputar sebagai audio Hi-Fi tanpa iklan (EQ aktif) lewat server cloud. <i id="afSt">Memeriksa server…</i></span></div>${sw('adFree')}</div>
       <div class="set-row"><div class="l"><b>Lagu dari Spotify diputar via</b><span>Lagu penuh lewat YouTube, Spotify embed (lagu penuh bila login Spotify di browser), atau preview 30 dtk Hi-Fi dengan EQ.</span></div>${seg('spMode', [['yt', 'YouTube'], ['embed', 'Spotify'], ['preview', 'Preview']])}</div>
       <div class="set-row"><div class="l"><b>Transisi halus</b><span>Fade-in/out antar lagu (detik)</span></div>${seg('fade', [[0, 'Mati'], [2, '2'], [4, '4'], [6, '6'], [10, '10']])}</div>
-      <div class="set-row"><div class="l"><b>Lanjutkan otomatis</b><span>Saat situs dibuka, lagu terakhir lanjut di detik yang sama. Browser bisa meminta satu sentuhan dulu; lagu yang terakhir Anda jeda tidak dilanjutkan.</span></div>${sw('autoResume')}</div>
-      <div class="set-row"><div class="l"><b>Autoplay lagu serupa</b><span>Saat antrean habis, lanjut otomatis dengan lagu mirip</span></div>${sw('autoRadio')}</div>
+      <div class="set-row"><div class="l"><b>Putar otomatis saat dibuka</b><span>Saat situs dibuka, musik langsung berputar dari lagu terakhir di detik yang sama. Browser bisa meminta satu sentuhan dulu.</span></div>${sw('autoResume')}</div>
+      <div class="set-row"><div class="l"><b>Autoplay lagu serupa</b><span>Saat antrean habis, lanjut dengan lagu mirip. Bila dimatikan, antrean diulang dari awal</span></div>${sw('autoRadio')}</div>
       <div class="set-row"><div class="l"><b>Tampilkan video musik</b><span>Video klip tampil otomatis; lagu audio menampilkan artwork (bisa diubah per lagu dengan tombol Video)</span></div>${sw('video')}</div>
       <div class="set-row"><div class="l"><b>Lirik mengambang</b><span>Lirik lagu yang diputar melayang di sepertiga kiri layar (layar lebar)</span></div>${sw('floatLy')}</div>
       <div class="set-row"><div class="l"><b>Pintasan keyboard</b><span>Spasi putar/jeda · ←/→ maju-mundur 5 dtk · Shift+←/→ lagu sebelumnya/berikutnya · ↑/↓ volume · M bisu · L suka · S acak · R ulangi · Q antrean · E EQ · F layar penuh · / cari</span></div></div>
@@ -1890,8 +1978,11 @@
     if (Engine.playing()) {
       listened += dt; S.listenSec = (S.listenSec || 0) + dt;
       if (!counted && (listened >= 30 || (d && listened >= d * 0.5))) { counted = true; countPlay(t); }
-      if (S.set.fade && d > 20 && !Engine.isLive() && !fadingOut && d - tm < S.set.fade && d - tm > 0.3 && S.repeat !== 2) { fadingOut = true; Engine.fade(0, (d - tm) * 1000); }
+      // YouTube reports an ad's own length while one runs, so its fade-out would mute the song after the ad: no fade there
+      if (S.set.fade && d > 20 && !Engine.isLive() && Engine.eng !== 'yt' && !fadingOut && d - tm < S.set.fade && d - tm > 0.3 && S.repeat !== 2) { fadingOut = true; Engine.fade(0, (d - tm) * 1000); }
+      else if (fadingOut && d - tm > S.set.fade + 1) { fadingOut = false; Engine.fade(1, 200); }
       if (!$('#bar').classList.contains('loading')) Q.t = tm;
+      if (d && d - tm < 30 && Engine.eng === 'au' && !Engine.isLive() && spareFor !== playTok) readySpare();
       if (now - lastSave > 5000) { lastSave = now; savePos(true); try { sessionStorage.setItem('amatu.playlist.t', String(Math.floor(tm))); } catch (e) { /* ignore */ } }
       if ('mediaSession' in navigator && navigator.mediaSession.setPositionState && d && Math.abs(tm - lastPos) > 0.9) { lastPos = tm; try { navigator.mediaSession.setPositionState({ duration: d, position: Math.min(tm, d), playbackRate: S.rate }); } catch (e) { /* ignore */ } }
     }
@@ -1927,19 +2018,21 @@
   Engine.setVol(S.vol); Engine.setMuted(S.muted); Engine.setRate(S.rate); Engine.eq(S.eq, false);
   if (!S.set.panel || innerWidth <= 1240) document.body.classList.add('nopanel');
   renderVol(); renderControls(); renderSideLists();
-  if (location.hash.startsWith('#t=')) openShared(); else render();
+  const openedShared = location.hash.startsWith('#t=');
+  if (openedShared) openShared(); else render();
   if (Q.list.length) { Q.i = Math.min(Q.i, Q.list.length - 1); renderNow(); }
   else renderPanel();
   // the first tap/click/key unlocks audio, so songs start by themselves even when their stream arrives later
   for (const ev of ['pointerdown', 'keydown', 'touchend', 'click']) document.addEventListener(ev, () => Engine.unlock(), { capture: true, passive: true });
   if (Q.list.length) prefetchNext(true);
   // lanjut otomatis: start by itself when the browser allows it, otherwise on the first touch anywhere
-  (function armResume() {
-    const shared = location.hash.startsWith('#t=');
+  (async function armResume() {
+    const shared = openedShared;
     const r = readPos();
     if (cur() && !shared && r) Q.t = r.k === curKey() ? r.t : 0;
     if (Q.list.length) renderNow();
-    if (!S.set.autoResume || !cur() || shared || (r && !r.on) || otherTabPlays(r)) return;
+    if (!S.set.autoResume || shared || otherTabPlays(r)) return;
+    if (!cur() && !(await firstQueue())) return;
     const hint = $('#rsm'), tok = playTok;
     const go = () => {
       if (!disarmResume) return;
@@ -1963,7 +2056,7 @@
     };
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKey, true);
-    $('#rsmX').onclick = (e) => { e.stopPropagation(); if (disarmResume) disarmResume(); };
+    $('#rsmX').onclick = (e) => { e.stopPropagation(); hint.hidden = true; if (disarmResume) disarmResume(); };
     Engine.canAutoplay().then((ok) => {
       if (!disarmResume) return;
       if (ok) return go();
@@ -1971,6 +2064,21 @@
       hint.hidden = false;
     });
   })();
+  // nothing queued on this device yet: what was heard last, else today's chart
+  async function firstQueue() {
+    const hist = (S.hist || []).slice(0, 40).map((h) => h.t).filter((t) => t && t.src !== 'file');
+    let list = hist, ctx = null;
+    if (!list.length) {
+      for (const [ref, name, href] of LIVE) {
+        const c = await collTracks(ref).catch(() => null);
+        if (c && c.tracks.length) { list = c.tracks.slice(0, 50); ctx = { name: c.name || name, href: c.href || href, ref, thumb: c.thumb }; break; }
+      }
+    }
+    if (!list.length || cur() || Engine.eng) return false;
+    Q.list = list.map((t) => Object.assign({}, t)); Q.i = 0; Q.ctx = ctx; Q.t = 0;
+    renderNow(); saveQ();
+    return true;
+  }
   // hovering (or pressing) a song warms its ad-free stream, so the click starts it sooner
   let hoverT = 0;
   const warm = (e) => {

@@ -34,7 +34,7 @@ window.Engine = (function () {
               if (cur !== 'yt') return;
               if (e.data === 1) { applyVol(); applyRate(); emit('state', true); }
               else if (e.data === 2) emit('state', false);
-              else if (e.data === 0) { emit('state', false); emit('end'); }
+              else if (e.data === 0) { emit('state', false); finish(); }
               else if (e.data === 3) emit('buffering');
             },
             onError: (e) => { yt.err = true; if (cur === 'yt') emit('error', { eng: 'yt', code: e.data }); },
@@ -50,25 +50,31 @@ window.Engine = (function () {
   }
 
   // ---------- Hi-Fi audio
-  const au = { el: new Audio(), raw: new Audio(), ctx: null, fx: null, a: null, live: false, src: '', bridging: false, noCors: '' };
-  au.el.crossOrigin = 'anonymous';
-  au.el.preload = 'auto';
-  au.raw.preload = 'auto';
+  // spare: the next song buffers in a second FX element and takes over the moment the current one ends, so no gap.
+  // Not on phones or Safari, where a second element can't start without a touch (the same element keeps the session).
+  const SPARE = !PHONE && !/^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  const au = { el: new Audio(), raw: new Audio(), spare: new Audio(), spareUrl: '', ctx: null, fx: null, a: null, live: false, src: '', bridging: false, noCors: '' };
+  for (const a of [au.el, au.spare]) a.crossOrigin = 'anonymous';
+  for (const a of [au.el, au.raw, au.spare]) a.preload = 'auto';
   const main = () => (noGraph() || au.noCors === au.src ? au.raw : au.el);
   const isCur = (a) => cur === 'au' && au.a === a && !au.bridging;
-  for (const a of [au.el, au.raw]) {
+  for (const a of [au.el, au.raw, au.spare]) {
     a.addEventListener('playing', () => { if (isCur(a)) emit('state', true); });
     a.addEventListener('pause', () => { if (isCur(a)) emit('state', false); });
     a.addEventListener('waiting', () => { if (isCur(a)) emit('buffering'); });
-    a.addEventListener('ended', () => { if (isCur(a)) { emit('state', false); emit('end'); } });
+    a.addEventListener('ended', () => { if (isCur(a)) { emit('state', false); finish(); } });
     a.addEventListener('loadedmetadata', () => { if (isCur(a)) emit('meta'); });
   }
-  au.el.addEventListener('error', () => {
-    if (!isCur(au.el) || !au.el.getAttribute('src') || au.el.src.startsWith('data:')) return;
+  for (const x of [au.el, au.spare]) x.addEventListener('error', () => {
+    if (x === au.spare) { au.spareUrl = ''; return; }
+    if (!isCur(x) || !x.getAttribute('src') || x.src.startsWith('data:')) return;
     // CORS refused (common for radio) → play untouched without FX
     if (au.live || au.src.startsWith('http')) {
+      const at = au.el.currentTime;
       au.noCors = au.src;
-      au.a = au.raw; au.raw.src = au.src; applyVol(); applyRate();
+      au.a = au.raw; au.raw.src = au.src;
+      if (at && !au.live) startAt(au.raw, at);
+      applyVol(); applyRate();
       au.raw.play().catch((e) => emit('error', { eng: 'au', code: 'play', msg: e.message }));
       emit('fx', false);
     } else emit('error', { eng: 'au', code: au.el.error && au.el.error.code });
@@ -81,6 +87,7 @@ window.Engine = (function () {
     au.ctx = C;
     au.fx = FX.make(C);
     C.createMediaElementSource(au.el).connect(au.fx.input);
+    if (SPARE) C.createMediaElementSource(au.spare).connect(au.fx.input);
     au.fx.apply(fxBypass ? Object.assign({}, eqState, { on: false }) : eqState);
   }
 
@@ -157,7 +164,7 @@ window.Engine = (function () {
     sp.paused = !!d.isPaused; sp.pos = (d.position || 0) / 1000; sp.dur = (d.duration || 0) / 1000;
     if (cur !== 'sp') return;
     if (sp.paused !== wasPaused) emit('state', !sp.paused);
-    if (sp.paused && sp.dur && sp.lastPos > sp.dur - 1.6 && sp.pos < 1) { sp.lastPos = 0; emit('end'); return; }
+    if (sp.paused && sp.dur && sp.lastPos > sp.dur - 1.6 && sp.pos < 1) { sp.lastPos = 0; finish(); return; }
     sp.lastPos = sp.pos;
   }
 
@@ -199,26 +206,37 @@ window.Engine = (function () {
     stopOthers(spec.eng);
     cur = spec.eng;
     want = auto; resetWd(); wd.resumes = [];
+    plan = null; endSent = false;
+    // a fade-out of the previous song must never carry over: that plays the whole song at volume 0 while the seconds run
+    if (!opt.keepFade) fade(1, 0);
     emit('engine', cur);
     if (spec.eng === 'yt') {
       const p = await ytInit();
       if (cur !== 'yt') return;
-      yt.err = false; yt.lastState = -1; wd.at = performance.now();
+      yt.err = false; yt.lastState = -1; yt.id = spec.id; wd.at = performance.now();
       if (auto) p.loadVideoById({ videoId: spec.id, startSeconds: start });
       else p.cueVideoById({ videoId: spec.id, startSeconds: start });
       applyVol();
     } else if (spec.eng === 'au') {
       au.live = !!spec.live; au.src = spec.url;
-      const a = main(), o = a === au.el ? au.raw : au.el;
+      let a = main();
+      const o = a === au.el ? au.raw : au.el;
       if (a === au.el) { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); }
       o.pause(); o.removeAttribute('src');
+      if (a === au.el && au.spareUrl === spec.url) {
+        const old = au.el;
+        au.el = au.spare; au.spare = old; au.spareUrl = '';
+        old.pause(); old.removeAttribute('src'); old.load();
+        a = au.el;
+      } else {
+        a.src = spec.url;
+      }
       au.a = a; a.loop = false;
-      a.src = spec.url;
       if (start) startAt(a, start);
       applyVol(); applyRate();
       emit('fx', a === au.el);
       // refused while the page is hidden: keep the intent, it starts when the watchdog or the user's return allows it
-      if (auto) await a.play().catch((e) => { if (e.name === 'NotAllowedError' && !document.hidden) { want = false; emit('state', false); } });
+      if (auto) await a.play().catch((e) => { if (e.name === 'NotAllowedError' && !document.hidden) { emit('state', false); emit('blocked'); } });
     } else if (spec.eng === 'sp') {
       const api = await spInit();
       if (cur !== 'sp') return;
@@ -245,6 +263,13 @@ window.Engine = (function () {
     else if (cur === 'au' && au.a) { if (au.ctx && au.ctx.state !== 'running') au.ctx.resume(); au.a.play().catch(() => {}); }
     else if (cur === 'sp' && sp.c) sp.c.resume();
   }
+  function preload(url) {
+    if (!SPARE || au.spareUrl === url || !url) return;
+    try { fxInit(); } catch (e) { return; }
+    au.spareUrl = url;
+    au.spare.src = url;
+    au.spare.load();
+  }
   function pause() {
     want = false;
     if (au.bridging) { au.bridging = false; if (au.a) au.a.pause(); }
@@ -265,12 +290,17 @@ window.Engine = (function () {
     if (cur === 'sp') return sp.pos;
     return 0;
   }
-  function duration() {
+  function rawDuration() {
     if (cur === 'yt' && yt.p && yt.p.getDuration) return yt.p.getDuration() || 0;
     if (au.bridging) return 0;
     if (cur === 'au' && au.a) return isFinite(au.a.duration) ? au.a.duration : 0;
     if (cur === 'sp') return sp.dur;
     return 0;
+  }
+  // a song followed by silence ends where the sound ends: the bar shows that length and the next song starts there
+  function duration() {
+    const d = rawDuration();
+    return plan && plan.end && d > plan.end ? plan.end : d;
   }
   function buffered() {
     if (cur === 'yt' && yt.p && yt.p.getVideoLoadedFraction) return yt.p.getVideoLoadedFraction() || 0;
@@ -278,6 +308,7 @@ window.Engine = (function () {
     return 0;
   }
   function seek(t) {
+    endSent = false; resetWd();
     if (cur === 'yt' && yt.p) yt.p.seekTo(t, true);
     else if (cur === 'au' && au.a && !au.live && !au.bridging) au.a.currentTime = t;
     else if (cur === 'sp' && sp.c) sp.c.seek(t);
@@ -305,9 +336,10 @@ window.Engine = (function () {
   // ---------- keep playing: the page wants music unless the user paused it. A song the browser or YouTube paused
   // on its own (window minimized, tab in the background, audio device change) is resumed, and a stream that stops
   // advancing (audio server / radio connection dropped) is reconnected at the same spot, then handed to the error path.
-  let want = false;
-  const wd = { t: -1, at: 0, fixes: 0, resumes: [] };
-  function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; }
+  let want = false, plan = null, endSent = false;
+  const wd = { t: -1, at: 0, fixes: 0, resumes: [], seekAt: 0, flat: 0, quiet: 0, ctxBad: 0 };
+  function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; wd.seekAt = 0; wd.flat = 0; wd.quiet = 0; wd.ctxBad = 0; }
+  function finish() { if (endSent) return; endSent = true; emit('end'); }
   function resume() {
     const now = performance.now(), win = document.hidden ? 600e3 : 60e3;   // another app taking the audio on a phone must win
     wd.resumes = wd.resumes.filter((x) => now - x < win);
@@ -315,25 +347,74 @@ window.Engine = (function () {
     wd.resumes.push(now);
     play(true);
   }
+  // Silent stretches found in the stream: jump over them, end the song where its sound ends.
+  function followPlan() {
+    if (!plan || !want || au.bridging || !cur || !playing()) return;
+    const t = time();
+    for (const [a, b] of plan.skips) if (t >= a && t < b - 0.5) { seek(b); return; }
+    if (plan.end && t >= plan.end) finish();
+  }
+  setInterval(followPlan, 400);
+  // Volume stuck low though nothing is fading: whatever left it there, the song must be heard.
+  function volumeGuard() {
+    if (fadeK > 0.99 || fadeDone || !playing()) { wd.flat = 0; return; }
+    if (++wd.flat >= 3) { wd.flat = 0; fade(1, 300); emit('fadefix'); }
+  }
+  // The element runs but nothing comes out of Web Audio: first wake it, then play without it. Digital silence for
+  // seconds on end is reported too, the app checks the stream itself to tell a silent song from a dead output.
+  const anBuf = new Float32Array(4096);
+  function outputGuard(a, t) {
+    if (a !== au.el || !au.ctx || au.live) { wd.quiet = 0; wd.ctxBad = 0; return; }
+    if (au.ctx.state !== 'running') {
+      au.ctx.resume().catch(() => {});
+      if (++wd.ctxBad >= 3) { wd.ctxBad = 0; useRaw(); }
+      return;
+    }
+    wd.ctxBad = 0;
+    if (!au.fx || fadeK < 0.5 || a.volume <= 0 || t < 1) { wd.quiet = 0; return; }
+    au.fx.n.an.getFloatTimeDomainData(anBuf);
+    let peak = 0;
+    for (let i = 0; i < anBuf.length; i += 2) { const x = Math.abs(anBuf[i]); if (x > peak) peak = x; }
+    if (peak / a.volume >= 0.002) { wd.quiet = 0; return; }
+    if (++wd.quiet >= 6) { wd.quiet = -20; emit('silent', t); }   // asks again in 26 s if it stays silent
+  }
+  function useRaw() {
+    if (cur !== 'au' || au.a !== au.el) return;
+    au.noCors = au.src;
+    reroute();
+  }
   setInterval(() => {
     if (!want || !cur) return;
+    volumeGuard();
     const now = performance.now();
     if (cur === 'yt' && yt.p && !yt.err) {
       const st = yt.lastState;
-      if (st === 2 || st === 5 || (st === -1 && now - wd.at > 6000)) resume();
+      if (st === 0) { wd.at = now; return; }
+      if (st === 2 || st === 5 || (st === -1 && now - wd.at > 6000)) { resume(); return; }
+      if (st !== 1 && st !== 3) return;
+      const t = yt.p.getCurrentTime ? yt.p.getCurrentTime() : 0;
+      if (t !== wd.t) { wd.t = t; wd.at = now; return; }
+      if (now - wd.at < 20e3) return;
+      wd.at = now;
+      if (wd.fixes++ < 1 && yt.id) yt.p.loadVideoById({ videoId: yt.id, startSeconds: t });
+      else emit('error', { eng: 'yt', code: 'stall' });
     } else if (cur === 'au' && au.a && au.a.getAttribute('src')) {
       const a = au.a;
       if (au.bridging) { if (a.paused && now - wd.at > 1500) { wd.at = now; a.play().catch(() => {}); } return; }
-      if (a.ended || a.seeking) { wd.at = now; return; }
+      if (a.ended) { wd.at = now; finish(); return; }
+      if (a.seeking && (!wd.seekAt || now - wd.seekAt < 10e3)) { wd.seekAt = wd.seekAt || now; wd.at = now; return; }
+      wd.seekAt = 0;
       if (a.paused) { if (now - wd.at > 1500) resume(); return; }
       const t = a.currentTime;
-      if (t !== wd.t) { wd.t = t; wd.at = now; return; }
-      if (now - wd.at < (t > 0.5 ? 15e3 : 45e3)) return;
+      if (t !== wd.t) { wd.t = t; wd.at = now; outputGuard(a, t); return; }
+      const d = duration();
+      if (d && d - t < 2.5 && now - wd.at > 3000) { finish(); return; }   // the last bytes never came: the song is over anyway
+      if (now - wd.at < (t > 0.5 ? 8e3 : 15e3) || navigator.onLine === false) return;
       wd.at = now;
       if (wd.fixes++ < 1) {
         if (au.ctx && au.ctx.state !== 'running') au.ctx.resume();
         a.src = a === au.raw ? au.raw.src : au.src;
-        if (t && !au.live) a.currentTime = t;
+        if (t && !au.live) startAt(a, t);
         a.play().catch(() => {});
       } else emit('error', { eng: 'au', code: 'stall' });
     }
@@ -345,7 +426,9 @@ window.Engine = (function () {
   });
 
   return {
-    on, load, play: () => play(), pause, unlock, bridge, canAutoplay, phone: PHONE, ios: IOS, noGraph, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade,
+    on, load, play: () => play(), pause, unlock, bridge, canAutoplay, phone: PHONE, ios: IOS, noGraph, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade, useRaw, preload,
+    setPlan(p) { plan = p && (p.end || p.skips.length) ? p : null; if (plan && !plan.end) endSent = false; },
+    finish,
     toggle() { playing() ? pause() : play(); },
     get eng() { return cur; },
     setVol(v) { vol = v; applyVol(); },
