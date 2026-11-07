@@ -6,7 +6,7 @@ window.API = (function () {
   function edge(params) {
     const q = new URLSearchParams(Object.assign({ v: '3' }, params)).toString();
     if (mem.has(q)) return mem.get(q);
-    const p = fetch(EDGE + '/?' + q).then((r) => r.json()).then((d) => {
+    const p = fetch(EDGE + '/?' + q, { signal: AbortSignal.timeout(20000) }).then((r) => r.json()).then((d) => {
       if (d.error) throw new Error(d.error);
       return d;
     });

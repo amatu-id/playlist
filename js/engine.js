@@ -58,12 +58,14 @@ window.Engine = (function () {
   for (const a of [au.el, au.raw, au.spare]) a.preload = 'auto';
   const main = () => (noGraph() || au.noCors === au.src ? au.raw : au.el);
   const isCur = (a) => cur === 'au' && au.a === a && !au.bridging;
+  const fresh = (u) => u.replace(/([?&])_r=[^&]*&?/, '$1').replace(/[?&]$/, '') + (u.includes('?') ? '&' : '?') + '_r=' + Date.now().toString(36);
   for (const a of [au.el, au.raw, au.spare]) {
-    a.addEventListener('playing', () => { if (isCur(a)) emit('state', true); });
+    a.addEventListener('playing', () => { if (isCur(a)) { wd.began = true; emit('state', true); } });
     a.addEventListener('pause', () => { if (isCur(a)) emit('state', false); });
     a.addEventListener('waiting', () => { if (isCur(a)) emit('buffering'); });
     a.addEventListener('ended', () => { if (isCur(a)) { emit('state', false); finish(); } });
     a.addEventListener('loadedmetadata', () => { if (isCur(a)) emit('meta'); });
+    a.addEventListener('progress', () => { if (isCur(a)) wd.prog = performance.now(); });
   }
   for (const x of [au.el, au.spare]) x.addEventListener('error', () => {
     if (x === au.spare) { au.spareUrl = ''; return; }
@@ -75,7 +77,7 @@ window.Engine = (function () {
       au.a = au.raw; au.raw.src = au.src;
       if (at && !au.live) startAt(au.raw, at);
       applyVol(); applyRate();
-      au.raw.play().catch((e) => emit('error', { eng: 'au', code: 'play', msg: e.message }));
+      au.raw.play().catch(() => { /* a failed load reports through the element's error event, a refusal through the watchdog */ });
       emit('fx', false);
     } else emit('error', { eng: 'au', code: au.el.error && au.el.error.code });
   });
@@ -219,6 +221,7 @@ window.Engine = (function () {
       applyVol();
     } else if (spec.eng === 'au') {
       au.live = !!spec.live; au.src = spec.url;
+      au.startMs = opt.startMs || 0; wd.began = false; wd.loadAt = performance.now();
       let a = main();
       const o = a === au.el ? au.raw : au.el;
       if (a === au.el) { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); }
@@ -337,7 +340,7 @@ window.Engine = (function () {
   // on its own (window minimized, tab in the background, audio device change) is resumed, and a stream that stops
   // advancing (audio server / radio connection dropped) is reconnected at the same spot, then handed to the error path.
   let want = false, plan = null, endSent = false;
-  const wd = { t: -1, at: 0, fixes: 0, resumes: [], seekAt: 0, flat: 0, quiet: 0, ctxBad: 0 };
+  const wd = { t: -1, at: 0, fixes: 0, resumes: [], seekAt: 0, flat: 0, quiet: 0, ctxBad: 0, began: false, loadAt: 0, prog: 0 };
   function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; wd.seekAt = 0; wd.flat = 0; wd.quiet = 0; wd.ctxBad = 0; }
   function finish() { if (endSent) return; endSent = true; emit('end'); }
   function resume() {
@@ -402,9 +405,18 @@ window.Engine = (function () {
       const a = au.a;
       if (au.bridging) { if (a.paused && now - wd.at > 1500) { wd.at = now; a.play().catch(() => {}); } return; }
       if (a.ended) { wd.at = now; finish(); return; }
+      // A stream that gives nothing right after it was asked for usually never will, and a hanging connection raises
+      // no error event at all. Report it soon, the app has other ways to get the song.
+      if (au.startMs && !wd.began && !a.paused) {
+        // data still arriving, only slowly, gets more time
+        if ((now - Math.max(wd.loadAt, wd.prog) < au.startMs && now - wd.loadAt < 20e3) || navigator.onLine === false) return;
+        wd.loadAt = now;
+        emit('error', { eng: 'au', code: 'start' });
+        return;
+      }
       if (a.seeking && (!wd.seekAt || now - wd.seekAt < 10e3)) { wd.seekAt = wd.seekAt || now; wd.at = now; return; }
       wd.seekAt = 0;
-      if (a.paused) { if (now - wd.at > 1500) resume(); return; }
+      if (a.paused) { wd.loadAt = now; if (now - wd.at > 1500) resume(); return; }
       const t = a.currentTime;
       if (t !== wd.t) { wd.t = t; wd.at = now; outputGuard(a, t); return; }
       const d = duration();
@@ -413,7 +425,9 @@ window.Engine = (function () {
       wd.at = now;
       if (wd.fixes++ < 1) {
         if (au.ctx && au.ctx.state !== 'running') au.ctx.resume();
-        a.src = a === au.raw ? au.raw.src : au.src;
+        // a new address: the browser holds a second request for the same one back while the stuck one is alive
+        if (au.startMs) { const was = au.src; au.src = fresh(was); if (au.noCors === was) au.noCors = au.src; wd.began = false; wd.loadAt = now; }
+        a.src = a === au.raw && !au.startMs ? au.raw.src : au.src;
         if (t && !au.live) startAt(a, t);
         a.play().catch(() => {});
       } else emit('error', { eng: 'au', code: 'stall' });
@@ -426,7 +440,7 @@ window.Engine = (function () {
   });
 
   return {
-    on, load, play: () => play(), pause, unlock, bridge, canAutoplay, phone: PHONE, ios: IOS, noGraph, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade, useRaw, preload,
+    on, load, play: () => play(), pause, began: () => wd.began, unlock, bridge, canAutoplay, phone: PHONE, ios: IOS, noGraph, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade, useRaw, preload,
     setPlan(p) { plan = p && (p.end || p.skips.length) ? p : null; if (plan && !plan.end) endSent = false; },
     finish,
     toggle() { playing() ? pause() : play(); },

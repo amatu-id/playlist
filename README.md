@@ -9,6 +9,7 @@ Pemutar musik web di **https://amatu-id.github.io/playlist/** (bagian dari Porta
 - Cari lagu, video, album, artis, playlist; tempel link YouTube/Spotify.
 - Antrean (putar berikutnya, drag urutkan), acak, ulangi, autoplay lagu serupa, radio dari lagu, transisi fade.
 - Musik tidak berhenti sendiri: langsung berputar saat situs dibuka (browser bisa meminta satu sentuhan), lagu berikutnya disiapkan 30 detik sebelum lagu berakhir, antrean habis → lagu serupa atau antrean diulang.
+- Mulai cepat: stream yang tidak memberi data dalam 6 detik atau tidak bisa dijangkau browser (mis. Chrome `ERR_ECH_FALLBACK_CERTIFICATE_INVALID` pada host `yt-comp*`) tidak ditunggu; satu link baru bila masih masuk akal, lalu pemutar YouTube. Lagu berikutnya mencoba jalur bebas iklan lagi.
 - Tanpa diam: `js/gap.js` mengambil contoh potongan audio lalu mendekodenya; lagu berakhir di tempat suaranya habis, bagian senyap di tengah dilompati, dan volume yang tersangkut atau jalur audio yang mati dipulihkan otomatis.
 - Lirik sinkron: dipakai hanya bila penyanyi + durasi cocok dengan audio yang diputar; selain itu baris & waktu ditulis dari audio lagu itu sendiri (Gemini, lirik versi lain hanya acuan ejaan), mini player (Picture-in-Picture), timer tidur, kecepatan putar, kontrol media/keyboard.
 - Equalizer 10 band + preset, bass boost, kejernihan, lebar stereo, balance, efek ruang, normalisasi volume, anti-clipping.

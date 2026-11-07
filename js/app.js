@@ -169,7 +169,7 @@
   }
 
   // ---------------------------------------------------------------- playback core
-  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0, failRun = 0;
+  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, afAt = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0, failRun = 0;
   const tried = new Set();
 
   // ---------------------------------------------------------------- ad-free audio (runs entirely from the web)
@@ -182,19 +182,21 @@
   const AF = new Map();
   // cloud: Invidious instances, the last one that worked first; the public list refreshes once a day
   const INV = ['https://yt.chocolatemoo53.com'];
-  const C = { list: null, at: 0, ok: null, failAt: 0 };
-  async function invList() {
+  const C = { list: null, at: 0, ok: null, failAt: 0, hangAt: 0 };
+  // never waited for: a song starts with what is known now, the list refreshes behind it
+  function invList() {
     if (C.list && Date.now() - C.at < 864e5) return C.list;
     let l = [];
     try { const c = JSON.parse(localStorage.getItem('pt.pl.inv') || 'null'); if (c && Date.now() - c.t < 864e5) l = c.l; } catch (e) { /* ignore */ }
+    const use = (x) => { C.list = [...new Set([...INV, ...x])].slice(0, 8); C.at = Date.now(); };
+    use(l);
     if (!l.length) {
-      try {
-        const r = await fetch('https://api.invidious.io/instances.json?sort_by=health', { signal: AbortSignal.timeout(6000) });
-        l = (await r.json()).filter(([, i]) => i && i.api && i.type === 'https' && i.uri).map(([, i]) => i.uri.replace(/\/$/, ''));
-        try { localStorage.setItem('pt.pl.inv', JSON.stringify({ t: Date.now(), l })); } catch (e) { /* ignore */ }
-      } catch (e) { /* list offline: built-ins only */ }
+      fetch('https://api.invidious.io/instances.json?sort_by=health', { signal: AbortSignal.timeout(6000) }).then((r) => r.json()).then((d) => {
+        const x = d.filter(([, i]) => i && i.api && i.type === 'https' && i.uri).map(([, i]) => i.uri.replace(/\/$/, ''));
+        try { localStorage.setItem('pt.pl.inv', JSON.stringify({ t: Date.now(), l: x })); } catch (e) { /* ignore */ }
+        use(x);
+      }).catch(() => { /* list offline: built-ins only */ });
     }
-    C.list = [...new Set([...INV, ...l])].slice(0, 8); C.at = Date.now();
     return C.list;
   }
   // what each video's stream is made of: length + the formats the silence scan can read
@@ -204,27 +206,45 @@
     const d = await r.json();
     const fm = (d.adaptiveFormats || []).filter((f) => /^audio\/mp4/.test(f.type || '') && f.url);
     const f = fm.find((f) => String(f.itag) === '140') || fm.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-    if (!f) throw new Error('no audio');
+    if (!f) throw Object.assign(new Error('no audio'), { answered: true });   // the server is fine, this video is not
     const abs = (x) => new URL(x.url, h).href, small = fm.find((f) => String(f.itag) === '139' && f.index) || f;
     VM.set(id, { sec: +d.lengthSeconds || 0, scan: small.index ? { url: abs(small), init: small.init, index: small.index } : null });
     if (VM.size > 300) VM.delete(VM.keys().next().value);
-    return { h, url: abs(f) };
+    return { h, url: withParam(abs(f), '_s', PAGE) };
+  }
+  // the server repeats a link for hours. A second request for one address waits in the browser while the first is alive,
+  // so a page never shares its address with another tab or with what a reload left behind. The server ignores the extra.
+  const PAGE = Date.now().toString(36);
+  const withParam = (u, k, v) => u + (u.includes('?') ? '&' : '?') + k + '=' + v;
+  // one slow answer must not decide the song: ask again after a moment, whichever answers first
+  function askHedged(h, id) {
+    return new Promise((res, rej) => {
+      let left = 2, timer = 0, sent = false;
+      const ask = (ms) => askHost(h, id, ms).then((v) => { clearTimeout(timer); sent = true; res(v); }, (e) => { if (e.answered || --left <= 0) { clearTimeout(timer); sent = true; rej(e); } else again(); });
+      const again = () => { if (sent) return; sent = true; clearTimeout(timer); ask(5500); };
+      ask(8000);
+      timer = setTimeout(again, 2500);
+    });
   }
   // the server that worked last, then all the others at once: a dead server must not keep the music waiting
   async function cloudUrl(id) {
-    const l = await invList(), first = C.ok || l[0];
+    const l = invList(), first = C.ok || l[0];
+    let answered = false;
     try {
-      const a = await askHost(first, id, 7000);
+      const a = await askHedged(first, id);
       C.ok = a.h; C.failAt = 0;
       return a.url;
-    } catch (e) { /* the others */ }
+    } catch (e) { answered = !!e.answered; }
     try {
-      const a = await Promise.any(l.filter((h) => h !== first).map((h) => askHost(h, id, 7000)));
+      const a = await Promise.any(l.filter((h) => h !== first).map((h) => askHost(h, id, 4000)));
       C.ok = a.h; C.failAt = 0;
       return a.url;
-    } catch (e) { /* none */ }
-    if (C.ok && l.length) C.ok = null;
-    C.failAt = Date.now();
+    } catch (e) { answered = answered || (e.errors || []).some((x) => x.answered); }
+    // one removed video says nothing about the server: only silence counts against it
+    if (!answered) {
+      if (C.ok && l.length) C.ok = null;
+      C.failAt = Date.now();
+    }
     throw new Error('cloud');
   }
   function adFreeUrl(id, fresh) {
@@ -239,9 +259,13 @@
   }
   // phones always use the audio stream: the YouTube iframe stops as soon as the screen locks or the browser is minimized
   const adFreeOn = () => !!(S.set.adFree || Engine.phone);
+  // How long a stream may stay without a first byte (normally 1–3 s). Just failed on another song: don't wait long again.
+  const hungLately = () => Date.now() - C.hangAt < 300e3;
+  const startLimit = () => (hungLately() ? 4000 : 6000);
   const wantsVideo = (t) => vidOverride.k === key(t) && vidOverride.v === true;
   async function ytSpec(t, id) {
     if (!adFreeOn() || wantsVideo(t)) return { eng: 'yt', id };
+    if (cloudDown()) return { eng: 'af', ar: id };   // the server just failed: no second wait for the same answer
     const url = await adFreeUrl(id);
     if (url && id !== t.id && tooLong(id, t)) return { eng: 'af', ar: id };
     return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id };
@@ -270,12 +294,14 @@
   }
   // no source can fetch this upload → another upload of the same song, still ad-free
   async function afAlt(t, tok) {
-    while (altTries < 3) {
+    const until = Date.now() + 10e3;   // looking for another upload must not take longer than the YouTube player needs
+    while (altTries < 3 && Date.now() < until) {
       altTries++;
-      const d = await API.search(`${t.title} ${artistsText(t)}`, altTries === 1 ? 'songs' : 'videos').catch(() => null);
+      const d = await Promise.race([API.search(`${t.title} ${artistsText(t)}`, altTries === 1 ? 'songs' : 'videos').catch(() => null), new Promise((r) => setTimeout(r, 6000, null))]);
       if (tok !== playTok) return;
       const cands = d ? API.tracksOf(d.items).filter((x) => !tried.has(x.id)).slice(0, 4) : [];
       for (const alt of cands) {
+        if (Date.now() >= until) break;
         tried.add(alt.id);
         const url = await adFreeUrl(alt.id, true);
         if (tok !== playTok) return;
@@ -284,7 +310,7 @@
         const orig = t.src === 'yt' ? t.id : S.match[t.id];
         if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
         curSpec = { eng: 'au', url, ar: alt.id }; afFix = 0;
-        Engine.load(curSpec, { autoplay: true, start: Q.t > 1 ? Q.t : 0 });   // another upload carries on near the same second
+        Engine.load(curSpec, { autoplay: true, start: Q.t > 1 ? Q.t : 0, startMs: startLimit() });   // another upload carries on near the same second
         renderNow(); addHist(t); loadLyrics(t); scanSong(tok);
         return;
       }
@@ -408,7 +434,8 @@
     if (!spec) { toast('Lagu tidak tersedia', 'err'); return next(true); }
     if (spec.eng === 'af') {
       curSpec = null; tried.add(spec.ar);
-      Engine.bridge(); Engine.stop(true); return afAlt(t, tok);
+      Engine.bridge(); Engine.stop(true);
+      return cloudDown() ? ytFallback(t, tok, Q.t) : afAlt(t, tok);
     }
     curSpec = spec;
     if (spec.id) tried.add(spec.id);
@@ -416,7 +443,7 @@
     Engine.fade(fade ? 0 : 1, 0);
     // armed before the song starts: its 'playing' event comes first, and a fade-in set after it would leave seconds of silence
     if (fade) { fadeInMs = Math.min(2500, S.set.fade * 700); setTimeout(() => { if (tok === playTok && fadeInMs) { Engine.fade(1, fadeInMs); fadeInMs = 0; } }, 4000); }
-    try { await Engine.load(spec, { start: opt.start || 0, autoplay: opt.autoplay !== false, keepFade: true }); }
+    try { await Engine.load(spec, { start: opt.start || 0, autoplay: opt.autoplay !== false, keepFade: true, startMs: spec.ar ? startLimit() : 0 }); }
     catch (e) { toast(e.message || 'Gagal memuat pemutar', 'err'); return; }
     if (tok !== playTok) return;
     $('#bar').classList.remove('loading');
@@ -528,22 +555,41 @@
     toast(tracks.length > 1 ? `${tracks.length} lagu ditambahkan ke antrean` : 'Ditambahkan ke antrean');
   }
 
+  // Can this page reach the stream at all? Chrome refuses the audio server's yt-comp hosts while their published ECH key
+  // doesn't match (ERR_ECH_FALLBACK_CERTIFICATE_INVALID, curl is fine), then every song fails the same way.
+  const unreachable = (url) => fetch(url, { headers: { Range: 'bytes=0-0' }, cache: 'no-store', signal: AbortSignal.timeout(4000) })
+    .then((r) => r.status === 429 || r.status >= 500, () => true);
+  let errBusy = 0;
+  async function audioFailed(t, tok, err) {
+    const spec = curSpec, id = spec.ar, at = Engine.time() || Q.t || 0, hang = err.code === 'start';
+    if (Date.now() - afAt > 120e3) afFix = 0;   // a song that played for a while earned a new try
+    afAt = Date.now();
+    const gone = () => tok !== playTok || curSpec !== spec;
+    const dead = !hang && !Engine.began() && await unreachable(spec.url);
+    if (gone()) return;
+    // one new link per song: the server repeats the same link for a while, more tries only keep the music waiting
+    if (!dead && afFix++ < 1 && !(hang && hungLately())) {
+      const url = await adFreeUrl(id, true);
+      if (gone()) return;
+      $('#bar').classList.add('loading');
+      if (url) { curSpec = { eng: 'au', url: withParam(url, '_r', Date.now().toString(36)), ar: id }; Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0, startMs: startLimit() }); return; }
+      if (!C.ok) return ytFallback(t, tok, at);
+    }
+    tried.add(id);
+    // the server can't be reached from here: another upload would fail the same way
+    if (dead || hang) { C.hangAt = Date.now(); return ytFallback(t, tok, at); }
+    return afAlt(t, tok);
+  }
   // errors from engines: unembeddable / removed video → try an alternative upload
   Engine.on('error', async (err) => {
     const t = cur();
     if (!t) return;
     const tok = playTok;
     if (err.eng === 'au' && curSpec && curSpec.ar) {
-      // stream broke or its link expired → same song, same spot
-      const id = curSpec.ar, at = Engine.time() || Q.t || 0;
-      if (afFix++ < 3) {
-        const url = await adFreeUrl(id, true);
-        if (tok !== playTok) return;
-        if (url) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }); return; }
-        if (!C.ok) return ytFallback(t, tok, at);
-      }
-      tried.add(id);
-      return afAlt(t, tok);
+      if (errBusy === tok) return;   // this song's failure is being handled
+      errBusy = tok;
+      try { await audioFailed(t, tok, err); } finally { if (errBusy === tok) errBusy = 0; }
+      return;
     }
     if (err.eng === 'yt' && altTries < 3) {
       altTries++;
@@ -572,6 +618,7 @@
   // other Amatu tabs drop their silent keep-alive (amatu.js) while a song plays here
   const audioBc = 'BroadcastChannel' in window ? new BroadcastChannel('amatu-audio') : null;
   Engine.on('state', (p) => {
+    if (p && Engine.eng === 'au') C.hangAt = 0;
     if (p) { bgRetry = 0; failRun = 0; $('#rsm').hidden = true; if (audioBc) audioBc.postMessage('playing'); }
     $('#bar').classList.remove('loading');
     if (p && fadeInMs) { Engine.fade(1, fadeInMs); fadeInMs = 0; }
@@ -1379,7 +1426,7 @@
     if (v && Engine.eng === 'au' && curSpec && curSpec.ar) { toast('Video memakai pemutar YouTube — bisa ada iklan. Matikan Video untuk kembali bebas iklan.'); curSpec = { eng: 'yt', id: curSpec.ar }; Engine.load(curSpec, { autoplay: Engine.playing(), start: Engine.time() }); }
     else if (!v && Engine.eng === 'yt' && adFreeOn() && curSpec && curSpec.id) {
       const id = curSpec.id, at = Engine.time(), was = Engine.playing(), tok = playTok;
-      adFreeUrl(id).then((url) => { if (url && tok === playTok && !isVideoMode()) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: was, start: at }); } });
+      adFreeUrl(id).then((url) => { if (url && tok === playTok && !isVideoMode()) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: was, start: at, startMs: startLimit() }); } });
     }
     renderNow();
   }
