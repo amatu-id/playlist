@@ -696,6 +696,7 @@
     if (k === 'my') { const l = S.lists.find((x) => x.id === id); return l ? { tracks: l.tracks, name: l.name, href: '#list/' + id, thumb: (l.tracks[0] || {}).thumb } : { tracks: [] }; }
     if (k === 'likes') return { tracks: S.likes.slice(), name: 'Lagu yang Disukai', href: '#likes' };
     if (k === 'mix') return { tracks: await API.radio(id), name: 'Mix', href: '#home' };
+    if (k === 'rock') { const c = rockCat(id); return c ? { tracks: API.tracksOf(c.songs), name: c.title, href: '#rock/' + c.key, thumb: rockThumb(c) } : { tracks: [] }; }
     return { tracks: [] };
   }
   async function playColl(ref, opt) {
@@ -830,10 +831,25 @@
 
   const greet = () => { const h = new Date().getHours(); return h < 11 ? 'Selamat pagi' : h < 15 ? 'Selamat siang' : h < 19 ? 'Selamat sore' : 'Selamat malam'; };
   const GENRES = [
+    ['Rock Legend', '#a3201d', '#rock/legend'], ['Pop Rock Viral', '#d84000', '#rock/viral'], ['Rock Terbaik', '#2d2a32', '#rock/terbaik'],
     ['Pop Indonesia', '#e13300'], ['Pop Jazz', '#1e3264'], ['Lagu Hits', '#8d67ab'], ['Indie Indonesia', '#27856a'], ['Galau', '#477d95'],
     ['Akustik', '#bc5900'], ['Dangdut', '#e8115b'], ['City Pop', '#dc148c'], ['Jazz', '#0d73ec'], ['R&B', '#ba5d07'], ['K-Pop', '#e91429'],
     ['Rock Indonesia', '#777777'], ['Lofi', '#503750'], ['90an', '#af2896'], ['2000an', '#148a08'], ['Religi', '#1e3264'], ['Koplo', '#e8115b'], ['Hip-Hop', '#bc5900'],
   ];
+
+  const genreTiles = (list) => list.map(([g, c, href]) => `<div class="genre" style="background:${c}" data-genre="${esc(g)}"${href ? ` data-go="${esc(href)}"` : ''}>${esc(g)}</div>`).join('');
+  const rockCat = (k) => (window.ROCK || []).find((c) => c.key === k);
+  const rockThumb = (c) => (c.albums[0] || c.songs[0] || {}).thumb || '';
+  const rockCtx = (c) => ({ name: c.title, href: '#rock/' + c.key, ref: 'rock:' + c.key, thumb: rockThumb(c) });
+  function rockShelves() {
+    let h = '';
+    for (const c of window.ROCK || []) {
+      const more = `<a href="#rock/${c.key}">Lihat semua</a>`;
+      h += shelf('Lagu ' + c.title, songCards(API.tracksOf(c.songs).slice(0, 24), rockCtx(c)), more);
+      h += shelf('Album ' + c.title, c.albums.slice(0, 24).map((it) => card(cardFor(it))).join(''), more);
+    }
+    return h;
+  }
 
   const VIEWS = {
     async home() {
@@ -848,8 +864,9 @@
       // live chart songs (refreshed by YouTube/Spotify daily/weekly), one tap to play
       h += LIVE.map(([ref, title, href], i) => `<section class="shelf" data-live="${i}"><div class="shelf-h"><h2>${esc(title)}</h2><a href="${href}">Lihat semua</a></div><div class="row">${'<div class="card sk"><div class="cv"></div><div class="t">&nbsp;</div><div class="s">&nbsp;</div></div>'.repeat(8)}</div></section>`).join('');
       setTimeout(fillLive, 0);
+      h += rockShelves();
       for (const s of window.HOME || []) h += shelf(s.title, s.items.map((it) => card(cardFor(it))).join(''));
-      h += `<section class="shelf"><div class="shelf-h"><h2>Jelajahi genre</h2></div><div class="genres">${GENRES.slice(0, 12).map(([g, c]) => `<div class="genre" style="background:${c}" data-genre="${esc(g)}">${esc(g)}</div>`).join('')}</div></section>`;
+      h += `<section class="shelf"><div class="shelf-h"><h2>Jelajahi genre</h2></div><div class="genres">${genreTiles(GENRES.slice(0, 15))}</div></section>`;
       return h;
     },
 
@@ -859,7 +876,7 @@
       if (!q) {
         let h = '<h1 class="v-title">Cari</h1>';
         if (S.recent.length) h += `<div class="shelf-h"><h2 style="font-size:18px">Pencarian terakhir</h2><button id="clrRecent">Hapus</button></div><div class="chips">${S.recent.map((r) => `<a class="chip" href="#search/${encodeURIComponent(r)}">${icon('clock')}${esc(r)}</a>`).join('')}</div>`;
-        h += `<div class="shelf-h"><h2 style="font-size:18px">Jelajahi semua</h2></div><div class="genres">${GENRES.map(([g, c]) => `<div class="genre" style="background:${c}" data-genre="${esc(g)}">${esc(g)}</div>`).join('')}</div>`;
+        h += `<div class="shelf-h"><h2 style="font-size:18px">Jelajahi semua</h2></div><div class="genres">${genreTiles(GENRES)}</div>`;
         setTimeout(() => { const b = $('#clrRecent'); if (b) b.onclick = () => { S.recent = []; save(); render(); }; if (!touch) $('#q').focus(); });
         return h;
       }
@@ -952,6 +969,19 @@
         inp.oninput = run;
       });
       return h;
+    },
+
+    async rock(arg, tok) {
+      const c = rockCat(arg) || (window.ROCK || [])[0];
+      if (!c) return empty('music', 'Tidak ada lagu');
+      const ctx = rockCtx(c), info = { title: c.title, thumb: ctx.thumb, sub: 'Koleksi rock' };
+      tintView(ctx.thumb, tok);
+      const total = c.songs.reduce((a, t) => a + (t.sec || 0), 0);
+      return `<div class="chips">${window.ROCK.map((x) => `<a class="chip${x === c ? ' on' : ''}" href="#rock/${x.key}">${esc(x.title)}</a>`).join('')}</div>
+        <div class="v-bg"></div><div class="hero"><div class="cv"${bg(ctx.thumb)}></div><div><div class="kind">Koleksi rock</div><h1 class="${c.title.length > 24 ? 'long' : ''}">${esc(c.title)}</h1><div class="desc">${esc(c.sub)}</div><div class="meta">${c.songs.length} lagu, ${fmtLong(total)} · ${c.albums.length} album</div></div></div>
+        <div class="actions"><button class="playbtn lg" data-act="pcoll" data-ref="${esc(ctx.ref)}">${icon(Q.ctx && Q.ctx.ref === ctx.ref && Engine.playing() ? 'pause' : 'play')}</button><button class="ib" data-act="pshuf" data-ref="${esc(ctx.ref)}" title="Putar acak">${icon('shuffle')}</button><button class="ib${isSaved(ctx.ref) ? ' on' : ''}" data-act="save" data-ref="${esc(ctx.ref)}" data-title="${esc(info.title)}" data-thumb="${esc(info.thumb)}" data-href="${esc(ctx.href)}" data-sub="${esc(info.sub)}" title="Simpan ke Pustaka">${icon(isSaved(ctx.ref) ? 'heartf' : 'heart')}</button></div>
+        ${trackList(API.tracksOf(c.songs), ctx)}
+        <div style="margin-top:30px"></div><div class="shelf-h"><h2>Album</h2></div><div class="grid">${c.albums.map((it) => card(cardFor(it))).join('')}</div>`;
     },
 
     async likes() {
@@ -1141,6 +1171,7 @@
     if (act === 'ly-off') { lyOff = Math.round((lyOff + +a.dataset.d) * 10) / 10; renderLyricsHead(); return; }
 
     const gen = e.target.closest('[data-genre]');
+    if (gen && gen.dataset.go) return go(gen.dataset.go);
     if (gen) return go('#search/' + encodeURIComponent(gen.dataset.genre + (/(Pop|Hits|Galau|Akustik|Indie|90an|2000an)/.test(gen.dataset.genre) ? ' playlist' : '')) + '/playlists');
 
     const qi = e.target.closest('[data-qi]');
