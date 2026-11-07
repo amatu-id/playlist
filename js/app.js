@@ -248,6 +248,7 @@
     }
     throw new Error('cloud');
   }
+  API.setInvHosts(() => [...new Set([C.ok, ...invList()].filter(Boolean))]);
   function adFreeUrl(id, fresh) {
     let c = AF.get(id);
     if (fresh || !c || Date.now() - c.t > 2 * 3600e3) {
@@ -541,6 +542,7 @@
     const list = await API.radio(id).catch(() => []);
     if (!list.length) return toast('Radio tidak tersedia', 'err');
     if (t.src === 'sp') list[0] = Object.assign({}, t);
+    else if (list[0].id !== id) list.unshift(Object.assign({}, t));   // a recommendation list doesn't start with the song itself
     setQueue(list, 0, { name: 'Radio · ' + t.title, href: '#home', ref: 'mix:' + id, thumb: t.thumb }, { shuffle: false });
   }
   function togglePlay() {

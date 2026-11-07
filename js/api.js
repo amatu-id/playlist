@@ -26,7 +26,29 @@ window.API = (function () {
 
   const search = (q, t) => edge({ a: 'search', q, t: t || 'all' });
   const browse = (id) => edge({ a: 'browse', id });
-  const radio = (v) => edge({ a: 'radio', v }).then((d) => tracksOf(d.items));
+  // YouTube refuses `next` from the edge server and the audio server refuses cloud addresses for its mixes, so while that
+  // lasts the page asks the audio server itself for the song's mix (else what YouTube recommends next to the song).
+  let invHosts = () => [];
+  const RADIO = new Map();
+  async function invRadio(v) {
+    for (const h of invHosts().slice(0, 2)) {
+      const ask = (path) => fetch(`${h}/api/v1/${path}`, { signal: AbortSignal.timeout(6000) }).then((r) => r.json()).catch(() => ({}));
+      let list = [];
+      // the same mix fails about every other time and then works (error 500 "Missing hash key")
+      for (let i = 0; i < 4 && !list.length; i++) list = (await ask(`mixes/RD${encodeURIComponent(v)}`)).videos || [];
+      if (!list.length) list = (await ask(`videos/${encodeURIComponent(v)}?local=true&fields=recommendedVideos`)).recommendedVideos || [];
+      list = list.filter((x) => x.videoId && x.lengthSeconds >= 60 && x.lengthSeconds <= 600);   // no hour-long compilations
+      if (list.length) return tracksOf(list.map((x) => ({ type: / - Topic$/i.test(x.author || '') ? 'song' : 'video', id: x.videoId, title: x.title || '', artists: [{ name: String(x.author || '').replace(/ - Topic$/i, ''), id: x.authorId }], sec: x.lengthSeconds })));
+    }
+    return [];
+  }
+  async function radio(v) {
+    if (RADIO.has(v)) return RADIO.get(v);
+    let l = await edge({ a: 'radio', v }).then((d) => tracksOf(d.items)).catch(() => []);
+    if (!l.length) l = await invRadio(v);
+    if (l.length) RADIO.set(v, l);
+    return l;
+  }
   const suggest = (q) => edge({ a: 'suggest', q }).then((d) => d.items || []).catch(() => []);
   const spotify = (u) => edge({ a: 'spotify', u });
 
@@ -218,5 +240,5 @@ window.API = (function () {
     return [];
   }
 
-  return { EDGE, edge, track, tracksOf, search, browse, radio, suggest, spotify, match, lyrics, lyricsUnsure, lyricQuery, translate, stations };
+  return { EDGE, edge, track, tracksOf, search, browse, radio, setInvHosts: (f) => { invHosts = f; }, suggest, spotify, match, lyrics, lyricsUnsure, lyricQuery, translate, stations };
 })();
