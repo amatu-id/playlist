@@ -15,13 +15,14 @@
   // ---------------------------------------------------------------- state
   const KEY = 'amatu.playlist', QKEY = 'amatu.playlist.q';
   const DEF = {
-    v: 1, likes: [], lists: [], saved: [], hist: [], plays: {}, recentCtx: [], recent: [], match: {}, alt: {}, noAf: {},
+    v: 1, likes: [], lists: [], saved: [], hist: [], plays: {}, recentCtx: [], recent: [], match: {}, noAf: {},
     eq: JSON.parse(JSON.stringify(FX.DEF)), myPresets: {},
     set: { spMode: 'yt', fade: 2, autoRadio: true, video: true, panel: true, ptab: 'np', adFree: true, floatLy: true, autoResume: true },
     vol: 0.8, muted: false, rate: 1, shuffle: false, repeat: 0, listenSec: 0,
   };
   function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) || d; } catch (e) { return d; } }
   const S = Object.assign({}, DEF, load(KEY, {}));
+  delete S.alt;   // older versions kept a replacement upload for good, see useAlt
   S.set = Object.assign({}, DEF.set, S.set);
   S.eq = Object.assign({}, FX.DEF, S.eq);
   const save = debounce(() => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast('Penyimpanan penuh', 'err'); } }, 400);
@@ -270,6 +271,14 @@
     if (url && id !== t.id && tooLong(id, t)) return { eng: 'af', ar: id };
     return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id };
   }
+  // A replacement upload only lasts this visit: it is often another singer's recording, and the song's own upload (which
+  // has its lyrics) usually works again later.
+  const ALT = {}, ALTBY = {};
+  function useAlt(t, alt) {
+    const o = t.src === 'yt' ? t.id : S.match[t.id];
+    if (o) ALT[o] = alt.id;
+    ALTBY[alt.id] = alt.artists || [];
+  }
   // another upload of a song may be an extended version, a medley or a video with a long empty end
   const tooLong = (id, t) => { const m = VM.get(id), sec = m && m.sec; return !!sec && (t.sec ? sec > t.sec * 1.4 + 20 : sec > 540); };
   // nothing ad-free answers: the YouTube player keeps the music going (it may show ads)
@@ -307,8 +316,7 @@
         if (tok !== playTok) return;
         if (!url && !C.ok) break;   // the servers are down: other uploads won't help
         if (!url || tooLong(alt.id, t)) continue;
-        const orig = t.src === 'yt' ? t.id : S.match[t.id];
-        if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
+        useAlt(t, alt);
         curSpec = { eng: 'au', url, ar: alt.id }; afFix = 0;
         Engine.load(curSpec, { autoplay: true, start: Q.t > 1 ? Q.t : 0, startMs: startLimit() });   // another upload carries on near the same second
         renderNow(); addHist(t); loadLyrics(t); scanSong(tok);
@@ -359,7 +367,7 @@
   });
   const cloudDown = () => Date.now() - C.failAt < 60e3;
   // look up the next songs early so they start instantly
-  const warmId = (t) => (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
+  const warmId = (t) => (t.src === 'yt' ? (ALT[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
   function prefetchNext(withCur) {
     if (!adFreeOn() || cloudDown()) return;
     for (const t of Q.list.slice(Q.i + (withCur ? 0 : 1), Q.i + 3)) {
@@ -395,7 +403,7 @@
 
   const MTHUMB = {};
   async function specFor(t) {
-    if (t.src === 'yt') return ytSpec(t, S.alt[t.id] || t.id);
+    if (t.src === 'yt') return ytSpec(t, ALT[t.id] || t.id);
     if (t.src === 'sp') {
       const m = S.set.spMode;
       if (m === 'embed') return { eng: 'sp', uri: 'spotify:track:' + t.id };
@@ -406,7 +414,7 @@
         if (m2) { id = m2.id; MTHUMB[id] = m2.thumb; S.match[t.id] = id; const ks = Object.keys(S.match); if (ks.length > 600) delete S.match[ks[0]]; save(); }
       }
       if (id && !t.ownThumb) { t.ownThumb = true; t.thumb = MTHUMB[id] || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`; }
-      if (id) return ytSpec(t, S.alt[id] || id);
+      if (id) return ytSpec(t, ALT[id] || id);
       if (t.preview) return { eng: 'au', url: t.preview };
       return { eng: 'sp', uri: 'spotify:track:' + t.id };
     }
@@ -599,11 +607,10 @@
       const alt = d && API.tracksOf(d.items).find((x) => !tried.has(x.id) && !tooLong(x.id, t));
       if (alt) {
         tried.add(alt.id);
-        const orig = t.src === 'yt' ? t.id : S.match[t.id];
-        if (orig) { S.alt[orig] = alt.id; const ks = Object.keys(S.alt); if (ks.length > 400) delete S.alt[ks[0]]; save(); }
+        useAlt(t, alt);
         curSpec = { eng: 'yt', id: alt.id };
         Engine.load(curSpec, { autoplay: true });
-        scanSong(tok);
+        scanSong(tok); loadLyrics(t);
         return;
       }
     }
@@ -1567,7 +1574,7 @@
   const LY = { key: '', data: null, state: 'idle', tr: null };
   const LYC = new Map();   // track + upload → { data, tr } for this visit
   let lyOff = 0, lyLast = -2, lyUserScroll = 0, aiPause = 0;
-  const ytIdOf = (t) => t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' ? S.match[t.id] || null : null;
+  const ytIdOf = (t) => { const o = t.src === 'yt' ? t.id : t.src === 'sp' ? S.match[t.id] : null; return o ? ALT[o] || o : null; };
   const lyNorm = (s) => (s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
   const sleepMs = (ms) => new Promise((ok) => setTimeout(ok, ms));
   // long instrumental parts: the last sung line should not stay lit until the next verse
@@ -1592,11 +1599,11 @@
     const d = await AMT.rpc('amt_lyrics_get', { p_id: id }).catch(() => null);
     return d && d.lines ? lyFromLines(t, d.lines) : null;
   }
-  async function aiLyrics(t, id, k, ref) {
-    if (!AMT || !rtoken() || t.sec > 900 || Date.now() < aiPause) return null;
+  async function aiLyrics(t, id, k, ref, sec) {
+    if (!AMT || !rtoken() || (sec || t.sec) > 900 || Date.now() < aiPause) return null;
     const q = API.lyricQuery(t);
     for (let i = 0; i < 6 && LY.key === k; i++) {
-      const r = await fetch(API.EDGE.replace('amatu-music', 'amatu-lirik') + '?' + new URLSearchParams({ id, t: q.title, ar: q.artist }), { method: 'POST', headers: { 'x-amatu': rtoken(), 'Content-Type': 'application/json' }, body: JSON.stringify({ ref: (ref || '').slice(0, 5000) }), signal: AbortSignal.timeout(170e3) });
+      const r = await fetch(API.EDGE.replace('amatu-music', 'amatu-lirik') + '?' + new URLSearchParams({ id, t: q.title, ar: q.artist, d: sec || t.sec || 0 }), { method: 'POST', headers: { 'x-amatu': rtoken(), 'Content-Type': 'application/json' }, body: JSON.stringify({ ref: (ref || '').slice(0, 5000) }), signal: AbortSignal.timeout(170e3) });
       const j = await r.json().catch(() => ({}));
       if (j.lines) return lyFromLines(t, j.lines);
       if (j.error === 'kuota' || j.error === 'limit') { aiPause = Date.now() + 1800e3; return null; }   // daily allowance gone: no point in asking every song
@@ -1629,7 +1636,7 @@
     if (LY.key !== k) return;
     const sec = await lyLength(t, k);
     if (LY.key !== k) return;
-    const f = await API.lyrics(t, id, sec).catch(() => ({ exact: null }));
+    const f = await API.lyrics(ALTBY[id] ? { ...t, artists: t.artists.concat(ALTBY[id]) } : t, id, sec).catch(() => ({ exact: null }));
     if (LY.key !== k) return;
     let d = f.exact, later = false;
     if (!d && id) {
@@ -1639,7 +1646,7 @@
       if (!d && API.lyricsUnsure() && LY.retry < 2) later = true;
       else if (!d) {
         if (f.text) lyShow(f.text, 'ok'); else { LY.state = 'gen'; refreshLyrics(); }   // words first when the right ones are known
-        d = await aiLyrics(t, id, k, f.ref).catch(() => null);
+        d = await aiLyrics(t, id, k, f.ref, sec).catch(() => null);
         if (LY.key !== k) return;
       }
     }
@@ -2164,7 +2171,7 @@
     if (!el || !adFreeOn() || cloudDown()) return;
     const L = LISTS.get((el.closest('[data-l]') || {}).dataset ? el.closest('[data-l]').dataset.l : '');
     const t = L && L.tracks[+el.dataset.i];
-    const id = t && (t.src === 'yt' ? (S.alt[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
+    const id = t && (t.src === 'yt' ? (ALT[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
     if (id) adFreeUrl(id);
   };
   document.addEventListener('pointerover', (e) => { clearTimeout(hoverT); if (!touch && e.target.closest && e.target.closest('.pi, .pb')) hoverT = setTimeout(() => warm(e), 300); }, { passive: true });
