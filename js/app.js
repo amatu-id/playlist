@@ -327,6 +327,35 @@
     }
     ytFallback(t, tok, Q.t);
   }
+  // ---------------------------------------------------------------- phones: screen off / browser in the background
+  // The YouTube player (fallback, or Video turned on) stops the moment a phone's screen goes off or the browser is
+  // minimized. The song moves to the audio stream at the same second.
+  let bgMove = 0;
+  async function ytToAudio() {
+    const t = cur(), spec = curSpec, tok = playTok;
+    if (!Engine.phone || !document.hidden || Engine.eng !== 'yt' || !Engine.wanted() || !t || !spec || !spec.id || bgMove === tok) return;
+    bgMove = tok;
+    const at = Engine.time() || Q.t || 0;
+    const url = await adFreeUrl(spec.id, cloudDown());
+    if (tok !== playTok || curSpec !== spec || !document.hidden) { if (bgMove === tok) bgMove = 0; return; }
+    if (url && !tooLong(spec.id, t)) {
+      curSpec = { eng: 'au', url, ar: spec.id };
+      Engine.load(curSpec, { autoplay: true, start: Math.max(Engine.time(), at) > 1 ? Math.max(Engine.time(), at) : 0, startMs: startLimit() });
+      scanSong(tok);
+      return;
+    }
+    // no stream right now: hold the audio session on silence and ask again (ytFallback keeps retrying while hidden)
+    Engine.stop(); Engine.bridge();
+    setTimeout(() => { if (tok === playTok) startCur({ start: at > 1 ? at : 0 }); }, 15e3);
+  }
+  // Back on screen the song stays on the audio stream: a phone would refuse to start the video without a tap, and the
+  // Video button brings it back at the same second.
+  document.addEventListener('visibilitychange', () => { if (document.hidden) ytToAudio(); else bgMove = 0; });
+  // the YouTube player paused itself while hidden (screen off came before the switch could run, or the system paused it)
+  Engine.on('state', (p) => { if (!p && document.hidden) ytToAudio(); });
+  // on a phone the stream of a song playing in the YouTube player is looked up ahead, so the switch is instant
+  Engine.on('engine', (e) => { if (e === 'yt' && Engine.phone && curSpec && curSpec.id && !cloudDown()) adFreeUrl(curSpec.id); });
+
   // ---------------------------------------------------------------- silence inside the stream
   const GAPS = new Map();
   let scanAbort = null;
@@ -436,7 +465,8 @@
     renderNow(); saveQ();
     $('#bar').classList.add('loading');
     // a stream already warmed starts at once; only a real wait needs the silent bridge
-    const wait = opt.autoplay !== false ? setTimeout(() => { if (tok === playTok) Engine.bridge(); }, 50) : 0;
+    // screen off on a phone: the page may be suspended within those 50 ms once the last song's sound stopped
+    const wait = opt.autoplay !== false ? setTimeout(() => { if (tok === playTok) Engine.bridge(); }, Engine.phone && document.hidden ? 0 : 50) : 0;
     const spec = await specFor(t).catch(() => null);
     clearTimeout(wait);
     if (tok !== playTok) return;
