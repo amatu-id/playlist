@@ -52,20 +52,26 @@ window.Engine = (function () {
   // ---------- Hi-Fi audio
   // spare: the next song buffers in a second FX element and takes over the moment the current one ends, so no gap.
   // Not on phones or Safari, where a second element can't start without a touch (the same element keeps the session).
+  // keep (phones): plays an inaudible tone from the tap until the song itself sounds, while the song's own element loads.
+  // A phone suspends a page that plays nothing as soon as the browser is left or the screen locks, and iOS keeps the
+  // audio session only while something plays — so between the tap (or the end of a song) and the first sound of the
+  // next one, this element keeps both alive.
   const SPARE = !PHONE && !/^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-  const au = { el: new Audio(), raw: new Audio(), spare: new Audio(), spareUrl: '', ctx: null, fx: null, a: null, live: false, src: '', bridging: false, noCors: '' };
+  const au = { el: new Audio(), raw: new Audio(), spare: new Audio(), keep: new Audio(), spareUrl: '', ctx: null, fx: null, a: null, live: false, src: '', bridging: false, noCors: '' };
   for (const a of [au.el, au.spare]) a.crossOrigin = 'anonymous';
-  for (const a of [au.el, au.raw, au.spare]) a.preload = 'auto';
+  for (const a of [au.el, au.raw, au.spare, au.keep]) a.preload = 'auto';
+  au.keep.loop = true;
   const main = () => (noGraph() || au.noCors === au.src ? au.raw : au.el);
   const isCur = (a) => cur === 'au' && au.a === a && !au.bridging;
   const fresh = (u) => u.replace(/([?&])_r=[^&]*&?/, '$1').replace(/[?&]$/, '') + (u.includes('?') ? '&' : '?') + '_r=' + Date.now().toString(36);
   for (const a of [au.el, au.raw, au.spare]) {
-    a.addEventListener('playing', () => { if (isCur(a)) { wd.began = true; emit('state', true); } });
+    a.addEventListener('playing', () => { if (isCur(a)) { wd.began = true; if (keeping) keepStop(); emit('state', true); } });
     a.addEventListener('pause', () => { if (isCur(a)) emit('state', false); });
     a.addEventListener('waiting', () => { if (isCur(a)) emit('buffering'); });
     a.addEventListener('ended', () => { if (isCur(a)) { emit('state', false); finish(); } });
-    a.addEventListener('loadedmetadata', () => { if (isCur(a)) emit('meta'); });
-    a.addEventListener('progress', () => { if (isCur(a)) wd.prog = performance.now(); });
+    a.addEventListener('loadedmetadata', () => { if (isCur(a)) { wd.prog = performance.now(); emit('meta'); } });
+    // any sign of life of a starting stream counts: iPhone's player asks for a few small pieces before the music data
+    for (const n of ['progress', 'loadeddata', 'canplay', 'durationchange']) a.addEventListener(n, () => { if (isCur(a)) wd.prog = performance.now(); });
   }
   for (const x of [au.el, au.spare]) x.addEventListener('error', () => {
     if (x === au.spare) { au.spareUrl = ''; return; }
@@ -103,30 +109,64 @@ window.Engine = (function () {
     return 'data:audio/wav;base64,' + btoa(String.fromCharCode.apply(null, b));
   })();
 
-  // A user gesture (tap/click/key) unlocks the Hi-Fi element + AudioContext once, so a track whose stream URL
-  // arrives seconds later (ad-free server) still starts by itself — Safari/iOS otherwise blocks that play().
-  let unlocked = false;
+  // 30 Hz at -66 dBFS: nobody hears it (phone speakers can't play 30 Hz at all), but a browser counts it as sound —
+  // Android lets a page that plays digital silence freeze like a silent one. Same tone as amatu.js uses.
+  const TONE = (() => {
+    const rate = 8000, n = rate, b = new DataView(new ArrayBuffer(44 + n * 2)), u8 = new Uint8Array(b.buffer);
+    const tag = (at, t) => { for (let i = 0; i < 4; i++) u8[at + i] = t.charCodeAt(i); };
+    tag(0, 'RIFF'); b.setUint32(4, 36 + n * 2, true); tag(8, 'WAVE'); tag(12, 'fmt '); b.setUint32(16, 16, true);
+    b.setUint16(20, 1, true); b.setUint16(22, 1, true); b.setUint32(24, rate, true); b.setUint32(28, rate * 2, true);
+    b.setUint16(32, 2, true); b.setUint16(34, 16, true); tag(36, 'data'); b.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) b.setInt16(44 + i * 2, Math.round(16 * Math.sin(2 * Math.PI * 30 * i / rate)), true);
+    let bin = ''; for (let i = 0; i < u8.length; i += 8192) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+    return 'data:audio/wav;base64,' + btoa(bin);
+  })();
+
+  // A user gesture (tap/click/key) unlocks each element a song or the keep-alive may play from, so a track whose stream
+  // URL arrives seconds later still starts by itself — iOS allows play() without a tap only on an element that already
+  // played once inside one. Elements in use are skipped: the user's own play covers them.
+  const primed = new WeakSet();
+  function prime(a) {
+    if (primed.has(a) || (a === au.keep ? keeping : (cur === 'au' && au.a === a) || a.getAttribute('src'))) return;
+    primed.add(a);
+    a.src = a === au.keep ? TONE : SILENT;
+    if (a === au.keep) primingKeep = true;
+    const p = a.play();
+    const done = () => { if (a === au.keep) primingKeep = false; if (a.src.startsWith('data:') && !(a === au.keep && keeping)) { a.pause(); a.removeAttribute('src'); a.load(); } };
+    // only a refusal means "not unlocked"; an AbortError comes from a song taking the element over a moment later
+    if (p && p.then) p.then(done, (e) => { if (e && e.name === 'NotAllowedError') primed.delete(a); done(); }); else done();
+  }
   function unlock() {
     if (!IOS) try { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); } catch (e) { /* no Web Audio */ }
-    const a = main();
-    if (unlocked || cur === 'au' || a.getAttribute('src')) return;
-    unlocked = true;
-    a.src = SILENT;
-    const p = a.play();
-    const done = () => { if (a.src === SILENT && !au.bridging) { a.pause(); a.removeAttribute('src'); a.load(); } };
-    if (p && p.then) p.then(done, () => { unlocked = false; done(); }); else done();
+    prime(main());
+    if (PHONE) prime(au.keep);
   }
 
-  // Between two songs nothing would be playing while the next stream is looked up, and a locked iPhone freezes the
-  // page in that gap so the next song never starts. Silence keeps the audio session, and with it this page, alive.
+  // Between the tap (or the end of a song) and the first sound of the next one nothing would be playing while the
+  // stream is looked up and loads (several seconds on an iPhone), and a phone freezes a silent page once the browser is
+  // left or the screen locks, so the next song never starts. The keep element plays meanwhile, on its own element so
+  // the song's element can load at the same time; it stops the moment the song is heard.
+  let keeping = false, primingKeep = false;
+  // iOS resumes an element it once paused itself when the page shows again (seen in the simulator): the keep-alive
+  // must only ever play while a song is on its way
+  au.keep.addEventListener('play', () => { if (!keeping && !primingKeep) au.keep.pause(); });
+  function keepStart() {
+    keeping = true;
+    const k = au.keep;
+    k.loop = true;
+    if (!k.paused && k.src === TONE) return;
+    if (k.src !== TONE) k.src = TONE;
+    k.play().catch(() => { /* not unlocked yet: the next tap does, the watchdog asks again */ });
+  }
+  function keepStop() {
+    keeping = false;
+    if (!au.keep.paused) au.keep.pause();
+  }
+  // the song before stops at once (the tap was heard); on phones the keep-alive plays until the new song sounds
   function bridge() {
-    if (!PHONE || cur === 'yt' || cur === 'sp') return;
-    const a = main();
-    if (au.bridging && !a.paused) return;
-    if (au.a && au.a !== a) au.a.pause();
-    au.bridging = true; au.a = a;
-    a.loop = true; a.src = SILENT;
-    a.play().catch(() => { /* not unlocked yet: the song itself asks again */ });
+    au.bridging = true; want = true;   // first: the old song's pause event must not report "stopped"
+    stopOthers(null);
+    if (PHONE) keepStart();
   }
   // A start position set before the metadata is loaded is ignored by some Safari versions.
   function startAt(a, t) {
@@ -205,6 +245,8 @@ window.Engine = (function () {
     opt = opt || {};
     const start = opt.start || 0, auto = opt.autoplay !== false;
     au.bridging = false;
+    // the keep-alive stays on until this song is heard (its 'playing'); the YouTube/Spotify players can't be kept alive
+    if (keeping && (spec.eng !== 'au' || !auto)) keepStop();
     stopOthers(spec.eng);
     cur = spec.eng;
     want = auto; resetWd(); wd.resumes = [];
@@ -275,12 +317,14 @@ window.Engine = (function () {
   }
   function pause() {
     want = false;
-    if (au.bridging) { au.bridging = false; if (au.a) au.a.pause(); }
+    au.bridging = false;
+    if (keeping) keepStop();
     if (cur === 'yt' && yt.p) yt.p.pauseVideo();
     else if (cur === 'au' && au.a) au.a.pause();
     else if (cur === 'sp' && sp.c) sp.c.pause();
   }
   function playing() {
+    if (au.bridging) return want;   // a song is on its way: play/pause must cancel it, not resume the one before
     if (cur === 'yt') return yt.lastState === 1 || yt.lastState === 3;
     if (cur === 'au') return !!au.a && !au.a.paused && !au.bridging;
     if (cur === 'sp') return !sp.paused;
@@ -340,7 +384,7 @@ window.Engine = (function () {
   // on its own (window minimized, tab in the background, audio device change) is resumed, and a stream that stops
   // advancing (audio server / radio connection dropped) is reconnected at the same spot, then handed to the error path.
   let want = false, plan = null, endSent = false;
-  const wd = { t: -1, at: 0, fixes: 0, resumes: [], seekAt: 0, flat: 0, quiet: 0, ctxBad: 0, began: false, loadAt: 0, prog: 0 };
+  const wd = { t: -1, at: 0, fixes: 0, resumes: [], seekAt: 0, flat: 0, quiet: 0, ctxBad: 0, began: false, loadAt: 0, prog: 0, keepAt: 0 };
   function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; wd.seekAt = 0; wd.flat = 0; wd.quiet = 0; wd.ctxBad = 0; }
   function finish() { if (endSent) return; endSent = true; emit('end'); }
   function resume() {
@@ -387,9 +431,11 @@ window.Engine = (function () {
     reroute();
   }
   setInterval(() => {
-    if (!want || !cur) return;
-    volumeGuard();
     const now = performance.now();
+    // the phone (another app's sound, a call) stopped the keep-alive: start it again while a song is still on its way
+    if (keeping && au.keep.paused && now - wd.keepAt > 1500) { wd.keepAt = now; au.keep.play().catch(() => {}); }
+    if (!want || !cur || au.bridging) return;   // bridging: the song before is paused on purpose, the next one isn't loaded yet
+    volumeGuard();
     if (cur === 'yt' && yt.p && !yt.err) {
       const st = yt.lastState;
       if (st === 0) { wd.at = now; return; }
@@ -403,13 +449,13 @@ window.Engine = (function () {
       else emit('error', { eng: 'yt', code: 'stall' });
     } else if (cur === 'au' && au.a && au.a.getAttribute('src')) {
       const a = au.a;
-      if (au.bridging) { if (a.paused && now - wd.at > 1500) { wd.at = now; a.play().catch(() => {}); } return; }
       if (a.ended) { wd.at = now; finish(); return; }
       // A stream that gives nothing right after it was asked for usually never will, and a hanging connection raises
-      // no error event at all. Report it soon, the app has other ways to get the song.
+      // no error event at all. Report it soon, the app has other ways to get the song. (startMs: the app's limit, longer
+      // on phones, where the player asks for several pieces one after another before the first sound.)
       if (au.startMs && !wd.began && !a.paused) {
         // data still arriving, only slowly, gets more time
-        if ((now - Math.max(wd.loadAt, wd.prog) < au.startMs && now - wd.loadAt < 20e3) || navigator.onLine === false) return;
+        if ((now - Math.max(wd.loadAt, wd.prog) < au.startMs && now - wd.loadAt < (PHONE ? 35e3 : 20e3)) || navigator.onLine === false) return;
         wd.loadAt = now;
         emit('error', { eng: 'au', code: 'start' });
         return;
@@ -454,10 +500,14 @@ window.Engine = (function () {
     hasFx() { return cur === 'au' && au.a === au.el && !au.bridging; },
     isLive() { return cur === 'au' && au.live; },
     ytVideo() { return yt.p && yt.p.getVideoData ? yt.p.getVideoData() : null; },
+    // keepBridge: a song is still being looked for — the keep-alive (and the wish for music) stays
     stop(keepBridge) {
-      want = false;
-      if (keepBridge && au.bridging) stopOthers('au'); else { au.bridging = false; stopOthers(null); }
+      if (!(keepBridge && au.bridging)) { want = false; au.bridging = false; if (keeping) keepStop(); }
+      stopOthers(null);
       cur = null; emit('engine', null);
     },
+    bridging: () => au.bridging,
+    // test/diagnostics: what the engine is doing right now
+    debug: () => ({ cur, want, bridging: au.bridging, keeping, keepPaused: au.keep.paused, src: au.a ? String(au.a.currentSrc || au.a.src || '').slice(0, 60) : '', t: time() }),
   };
 })();

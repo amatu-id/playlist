@@ -228,8 +228,15 @@
     });
   }
   // the server that worked last, then all the others at once: a dead server must not keep the music waiting
-  async function cloudUrl(id) {
+  // quiet: a background look-ahead — its failure (a busy server refusing extra requests) must not mark the server down,
+  // that would send the next real tap to the YouTube player
+  async function cloudUrl(id, quiet) {
     const l = invList(), first = C.ok || l[0];
+    if (quiet) {
+      const a = await askHost(first, id, 8000);
+      C.ok = a.h;
+      return a.url;
+    }
     let answered = false;
     try {
       const a = await askHedged(first, id);
@@ -249,28 +256,78 @@
     throw new Error('cloud');
   }
   API.setInvHosts(() => [...new Set([C.ok, ...invList()].filter(Boolean))]);
-  function adFreeUrl(id, fresh) {
+  // Links of songs heard lately survive a reload (device only, pt.* never syncs): such a song starts without asking the
+  // server again. The server's links stay valid for hours (expire=…); one that fails is looked up again as usual.
+  const AFK = 'pt.pl.af', AF_KEEP = 60;
+  let afStore = null;
+  const afDisk = () => { if (!afStore) { try { afStore = JSON.parse(localStorage.getItem(AFK) || '{}') || {}; } catch (e) { afStore = {}; } } return afStore; };
+  const saveAf = debounce(() => {
+    const s = afDisk(), ks = Object.keys(s);
+    if (ks.length > AF_KEEP) for (const k of ks.sort((a, b) => s[a].at - s[b].at).slice(0, ks.length - AF_KEEP)) delete s[k];
+    try { localStorage.setItem(AFK, JSON.stringify(s)); } catch (e) { /* storage full: memory only */ }
+  }, 2000);
+  const expOf = (u) => { try { return +new URL(u).searchParams.get('expire') * 1000 || 0; } catch (e) { return 0; } };
+  const pageAddr = (u) => withParam(u.replace(/([?&])_[sr]=[^&]*/g, '$1').replace(/[?&]+$/, '').replace(/\?&/, '?').replace(/&&+/g, '&'), '_s', PAGE);
+  function rememberAf(id, u) {
+    const m = VM.get(id);
+    afDisk()[id] = { u, x: expOf(u), s: m ? m.sec : 0, sc: m && m.scan ? [m.scan.url, m.scan.init, m.scan.index] : 0, at: Date.now() };
+    saveAf();
+  }
+  function afFromDisk(id) {
+    const d = afDisk()[id];
+    if (!d || !d.u || d.x - Date.now() < 30 * 60e3 || Date.now() - d.at > 3 * 3600e3) return null;
+    if (!VM.has(id)) VM.set(id, { sec: d.s || 0, scan: d.sc ? { url: d.sc[0], init: d.sc[1], index: d.sc[2] } : null });
+    return { p: Promise.resolve(pageAddr(d.u)), t: d.at, direct: '' };
+  }
+  // The audio server answers every request with a redirect to the node that holds the stream, and iPhone's player asks
+  // for three pieces one after another before the first sound, each paying for that extra trip to the US. The node's
+  // own address is learned once in the background (a plain GET: read where it ended up, cancel the body) and the
+  // player then talks to the node directly. Only for songs about to play (current, next, pressed).
+  function resolveDirect(url) {
+    const ac = new AbortController(), t = setTimeout(() => ac.abort(), 9000);
+    return fetch(url, { signal: ac.signal }).then((r) => {
+      clearTimeout(t);
+      const u = r.url;
+      ac.abort();
+      return r.ok && u && new URL(u).host !== new URL(url).host ? u : '';
+    }, () => { clearTimeout(t); return ''; });
+  }
+  function adFreeUrl(id, fresh, direct, quiet) {
     let c = AF.get(id);
+    if (!fresh && !c) { c = afFromDisk(id); if (c) AF.set(id, c); }
     if (fresh || !c || Date.now() - c.t > 2 * 3600e3) {
-      c = { p: cloudUrl(id), t: Date.now() };
+      if (fresh) delete afDisk()[id];
+      c = { p: cloudUrl(id, quiet), t: Date.now(), direct: '' };
       AF.set(id, c);
-      c.p.catch(() => { if (AF.get(id) === c) AF.delete(id); });
+      const me = c;
+      c.p.then((u) => rememberAf(id, u), () => { if (AF.get(id) === me) AF.delete(id); });
       if (AF.size > 200) AF.delete(AF.keys().next().value);
+    }
+    if (direct && Engine.phone && !c.dp) {
+      const me = c;
+      c.dp = c.p.then((u) => resolveDirect(u)).then((d) => { if (d && AF.get(id) === me) me.direct = d; }, () => {});
     }
     return c.p.catch(() => null);
   }
+  // the node's own address when it is known already, else the server's (which redirects)
+  const directOf = (id) => { const c = AF.get(id); return (c && c.direct) || ''; };
+  const dropDirect = (id) => { const c = AF.get(id); if (c) { c.direct = ''; c.dp = null; } };
   // phones always use the audio stream: the YouTube iframe stops as soon as the screen locks or the browser is minimized
   const adFreeOn = () => !!(S.set.adFree || Engine.phone);
   // How long a stream may stay without a first byte (normally 1–3 s). Just failed on another song: don't wait long again.
+  // Phones get much longer: iPhone's player asks the US server for three pieces one after another before the first
+  // sound (4–10 s on mobile data). Cutting that short sent songs to the YouTube player, which stops once the browser is
+  // left or the screen locks — the music "died" every time the user left the browser.
   const hungLately = () => Date.now() - C.hangAt < 300e3;
-  const startLimit = () => (hungLately() ? 4000 : 6000);
+  const startLimit = () => (Engine.phone ? (hungLately() ? 12000 : 16000) : (hungLately() ? 4000 : 6000));
   const wantsVideo = (t) => vidOverride.k === key(t) && vidOverride.v === true;
   async function ytSpec(t, id) {
     if (!adFreeOn() || wantsVideo(t)) return { eng: 'yt', id };
     if (cloudDown()) return { eng: 'af', ar: id };   // the server just failed: no second wait for the same answer
-    const url = await adFreeUrl(id);
+    const url = await adFreeUrl(id, false, true);
     if (url && id !== t.id && tooLong(id, t)) return { eng: 'af', ar: id };
-    return url ? { eng: 'au', url, ar: id } : { eng: 'af', ar: id };
+    // api: the server's own address, the fallback when the node's address (url) fails
+    return url ? { eng: 'au', url: directOf(id) || url, api: url, ar: id } : { eng: 'af', ar: id };
   }
   // A replacement upload only lasts this visit: it is often another singer's recording, and the song's own upload (which
   // has its lyrics) usually works again later.
@@ -288,17 +345,18 @@
     if (tok !== playTok) return;
     const id = (curSpec && curSpec.ar) || [...tried][0] || (t.src === 'yt' ? t.id : S.match[t.id]);
     if (!id) return next(true);
-    // screen locked: the iframe could not play anyway, so stay alive on silence and ask the audio sources again
-    if (Engine.phone && document.hidden && bgRetry < 30) {
+    // screen locked / browser left: the iframe could not play anyway, so stay alive on the keep-alive and ask the audio
+    // sources again soon
+    if (Engine.phone && document.hidden && bgRetry < 40) {
       bgRetry++;
       Engine.bridge();
-      setTimeout(() => { if (tok === playTok) startCur({ start: at > 1 ? at : 0 }); }, 20e3);
+      setTimeout(() => { if (tok === playTok) startCur({ start: at > 1 ? at : 0 }); }, 8e3);
       return;
     }
     if (Date.now() - ytFbAt > 600e3) toast('Server bebas iklan tidak tersedia — memakai pemutar YouTube (bisa ada iklan)', 'err');
     ytFbAt = Date.now();
     curSpec = { eng: 'yt', id }; altTries = 3;
-    Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }).then(() => { if (tok === playTok) $('#bar').classList.remove('loading'); }, () => {});
+    Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0 }).then(() => { if (tok === playTok) setLoading(false); }, () => {});
     renderNow(); scanSong(tok);
     if (!at) { addHist(t); loadLyrics(t); }
   }
@@ -336,11 +394,13 @@
     if (!Engine.phone || !document.hidden || Engine.eng !== 'yt' || !Engine.wanted() || !t || !spec || !spec.id || bgMove === tok) return;
     bgMove = tok;
     const at = Engine.time() || Q.t || 0;
-    const url = await adFreeUrl(spec.id, cloudDown());
-    if (tok !== playTok || curSpec !== spec || !document.hidden) { if (bgMove === tok) bgMove = 0; return; }
+    // the keep-alive holds the audio session (and the page) from this moment: the phone is stopping the YouTube player
+    Engine.bridge();
+    const url = await adFreeUrl(spec.id, cloudDown(), true);
+    if (tok !== playTok || curSpec !== spec || !document.hidden) { if (bgMove === tok) bgMove = 0; if (tok === playTok && curSpec === spec && Engine.bridging()) Engine.load(spec, { autoplay: true, start: at > 1 ? at : 0 }); return; }
     if (url && !tooLong(spec.id, t)) {
-      curSpec = { eng: 'au', url, ar: spec.id };
-      Engine.load(curSpec, { autoplay: true, start: Math.max(Engine.time(), at) > 1 ? Math.max(Engine.time(), at) : 0, startMs: startLimit() });
+      curSpec = { eng: 'au', url: directOf(spec.id) || url, api: url, ar: spec.id };
+      Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0, startMs: startLimit() });
       scanSong(tok);
       return;
     }
@@ -354,7 +414,7 @@
   // the YouTube player paused itself while hidden (screen off came before the switch could run, or the system paused it)
   Engine.on('state', (p) => { if (!p && document.hidden) ytToAudio(); });
   // on a phone the stream of a song playing in the YouTube player is looked up ahead, so the switch is instant
-  Engine.on('engine', (e) => { if (e === 'yt' && Engine.phone && curSpec && curSpec.id && !cloudDown()) adFreeUrl(curSpec.id); });
+  Engine.on('engine', (e) => { if (e === 'yt' && Engine.phone && curSpec && curSpec.id && !cloudDown()) adFreeUrl(curSpec.id, false, true); });
 
   // ---------------------------------------------------------------- silence inside the stream
   const GAPS = new Map();
@@ -402,7 +462,7 @@
     if (!adFreeOn() || cloudDown()) return;
     for (const t of Q.list.slice(Q.i + (withCur ? 0 : 1), Q.i + 3)) {
       const id = warmId(t);
-      if (id) adFreeUrl(id);
+      if (id) adFreeUrl(id, false, true);
     }
   }
   // the last half minute of a song: buffer the next one, it starts the moment this one ends
@@ -414,7 +474,7 @@
     const nx = Q.list[Q.i + 1] || (ahead && ahead.k === k && ahead.list[0]) || (!S.set.autoRadio || S.repeat === 1 ? Q.list[0] : null);
     const id = nx && nx.src !== 'radio' && !wantsVideo(nx) && warmId(nx);
     if (!id) return;
-    const url = await adFreeUrl(id);
+    const url = await adFreeUrl(id, false, true);
     if (url && tok === playTok && !tooLong(id, nx)) Engine.preload(url);
   }
   // last song of the queue: find what plays after it now, while it is still playing. On a locked phone the lookup
@@ -427,7 +487,7 @@
       if (curKey() !== k || !l.length) return;
       ahead = { k, list: l };
       const id = adFreeOn() && !cloudDown() && warmId(l[0]);
-      if (id) adFreeUrl(id);
+      if (id) adFreeUrl(id, false, true);
     }, () => {});
   }
 
@@ -462,13 +522,13 @@
     if (disarmResume) disarmResume();
     listened = 0; counted = false; fadingOut = false; altTries = 0; afFix = 0; tried.clear();
     Q.t = opt.start || 0;
+    setLoading(true);
     renderNow(); saveQ();
-    $('#bar').classList.add('loading');
-    // a stream already warmed starts at once; only a real wait needs the silent bridge
-    // screen off on a phone: the page may be suspended within those 50 ms once the last song's sound stopped
-    const wait = opt.autoplay !== false ? setTimeout(() => { if (tok === playTok) Engine.bridge(); }, Engine.phone && document.hidden ? 0 : 50) : 0;
+    // The song before stops at once (the tap is answered right away) and on a phone the keep-alive plays from this
+    // moment until the new song sounds: a phone freezes a silent page as soon as the browser is left or the screen
+    // locks, and the lookup + first bytes take seconds.
+    if (opt.autoplay !== false) Engine.bridge();
     const spec = await specFor(t).catch(() => null);
-    clearTimeout(wait);
     if (tok !== playTok) return;
     if (!spec) { toast('Lagu tidak tersedia', 'err'); return next(true); }
     if (spec.eng === 'af') {
@@ -485,12 +545,67 @@
     try { await Engine.load(spec, { start: opt.start || 0, autoplay: opt.autoplay !== false, keepFade: true, startMs: spec.ar ? startLimit() : 0 }); }
     catch (e) { toast(e.message || 'Gagal memuat pemutar', 'err'); return; }
     if (tok !== playTok) return;
-    $('#bar').classList.remove('loading');
+    if (spec.eng !== 'au' || Engine.began() || opt.autoplay === false) setLoading(false);
     if (opt.autoplay !== false) addHist(t);
     renderNow();
     loadLyrics(t);
     scanSong(tok);
     setTimeout(() => { if (tok === playTok) { prefetchNext(); warmRadio(); } }, 2500);
+  }
+
+  // ---------------------------------------------------------------- loading state + touch feedback
+  // From the tap until the song sounds: the bar shows it (spinner on play, running line), so does the song's own row or
+  // card, and the play button that was pressed.
+  function setLoading(on) {
+    $('#bar').classList.toggle('loading', !!on);
+    document.body.classList.toggle('ld', !!on);
+    if (!on) clearPend();
+  }
+  const isLoading = () => $('#bar').classList.contains('loading');
+  let pendT = 0;
+  function markPend(el) {
+    clearPend();
+    if (!el) return;
+    el.classList.add('pend');
+    pendT = setTimeout(clearPend, 25e3);
+  }
+  function clearPend() { clearTimeout(pendT); $$('.pend').forEach((x) => x.classList.remove('pend')); }
+  // A light tick under the finger: Android vibrates, iPhone (iOS 18+) has no vibrate() but ticks when a switch control
+  // toggles, so a hidden one is toggled. Must run inside the tap.
+  const hapEl = (() => {
+    if (!touch || navigator.vibrate) return null;
+    const l = document.createElement('label'), i = document.createElement('input');
+    i.type = 'checkbox'; i.setAttribute('switch', ''); i.tabIndex = -1;
+    l.setAttribute('aria-hidden', 'true'); l.dataset.hap = '1';
+    l.style.cssText = 'position:fixed;left:-99px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;overflow:hidden';
+    l.appendChild(i);
+    document.body.appendChild(l);
+    return l;
+  })();
+  function haptic() {
+    if (!touch) return;
+    try { if (navigator.vibrate) navigator.vibrate(12); else if (hapEl) hapEl.click(); } catch (e) { /* no haptics */ }
+  }
+  // The press shows under the finger: :active scales play buttons/cards while touched (iOS applies :active only when a
+  // touch listener exists), and on release a ring grows out of the play button or the row/card flashes.
+  document.addEventListener('touchstart', () => {}, { passive: true });
+  document.addEventListener('click', (e) => {
+    // nearest first: a play button inside a card rings, the rest of the card flashes
+    const fx = e.target.closest && e.target.closest('.pb, .playbtn, .pi, .tr, .card, .mini-tr, .best');
+    if (!fx || e.target.closest('[data-hap]')) return;
+    fx.classList.remove('tapfx'); void fx.offsetWidth; fx.classList.add('tapfx');
+    clearTimeout(fx._tfx); fx._tfx = setTimeout(() => fx.classList.remove('tapfx'), 600);
+  }, true);
+  // pause; a song still on its way is cancelled — otherwise it would start by itself a moment later
+  function pauseNow() {
+    if (Engine.bridging()) {
+      playTok++;
+      Engine.stop();
+      setLoading(false); renderPlayState(false); savePos(false);
+      return;
+    }
+    Engine.pause();
+    if (isLoading()) setLoading(false);
   }
 
   function setQueue(tracks, i, ctx, opt) {
@@ -577,8 +692,9 @@
   }
   function togglePlay() {
     if (!cur()) { const h = S.hist[0]; if (h) setQueue([h.t], 0, null); return; }
+    if (Engine.playing()) return pauseNow();
     if (!Engine.eng) return startCur({ start: Q.t || 0 });
-    Engine.toggle();
+    Engine.play();
   }
   function playNext(tracks) {
     tracks = [].concat(tracks).map((t) => Object.assign({}, t));
@@ -605,13 +721,24 @@
     if (Date.now() - afAt > 120e3) afFix = 0;   // a song that played for a while earned a new try
     afAt = Date.now();
     const gone = () => tok !== playTok || curSpec !== spec;
+    // phones: the keep-alive holds the session (and a locked phone's page) while the song is fetched again
+    if (Engine.phone) Engine.bridge();
+    // the node's own address failed: the server's address sends the player to a node that works, no new lookup
+    if (spec.api && spec.url !== spec.api) {
+      dropDirect(id);
+      setLoading(true);
+      curSpec = { eng: 'au', url: spec.api, ar: id };
+      Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0, startMs: startLimit() });
+      return;
+    }
     const dead = !hang && !Engine.began() && await unreachable(spec.url);
     if (gone()) return;
     // one new link per song: the server repeats the same link for a while, more tries only keep the music waiting
-    if (!dead && afFix++ < 1 && !(hang && hungLately())) {
+    // (phones: a slow start is normal there, a new link is worth one more try)
+    if (!dead && afFix++ < 1 && !(hang && hungLately() && !Engine.phone)) {
       const url = await adFreeUrl(id, true);
       if (gone()) return;
-      $('#bar').classList.add('loading');
+      setLoading(true);
       if (url) { curSpec = { eng: 'au', url: withParam(url, '_r', Date.now().toString(36)), ar: id }; Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0, startMs: startLimit() }); return; }
       if (!C.ok) return ytFallback(t, tok, at);
     }
@@ -659,13 +786,15 @@
   Engine.on('state', (p) => {
     if (p && Engine.eng === 'au') C.hangAt = 0;
     if (p) { bgRetry = 0; failRun = 0; $('#rsm').hidden = true; if (audioBc) audioBc.postMessage('playing'); }
-    $('#bar').classList.remove('loading');
+    // the song before being stopped for the new one is not "stopped": the loading state stays until the new one sounds
+    if (p || !Engine.wanted()) setLoading(false);
     if (p && fadeInMs) { Engine.fade(1, fadeInMs); fadeInMs = 0; }
     renderPlayState(p);
   });
   Engine.on('engine', () => { Engine.setPlan(GAPS.get(curVid()) || null); renderNow(); });
   // the browser refused to start sound: the song stays wanted and starts on the first touch (the watchdog retries)
   Engine.on('blocked', () => {
+    setLoading(false);
     if (!cur()) return;
     const hint = $('#rsm');
     $('#rsmT').textContent = cur().title;
@@ -747,8 +876,9 @@
       items.push({ label: 'Mulai radio lagu ini', icon: 'radio', run: () => startRadio(t) });
     }
     items.push('-');
-    const a = (t.artists || []).find((x) => x.id);
+    const a = (t.artists || []).find((x) => x.id), an = (t.artists || [])[0];
     if (a) items.push({ label: 'Buka artis', icon: 'music', run: () => go('#artist/' + a.id) });
+    else if (an && an.name && t.src !== 'file' && t.src !== 'radio') items.push({ label: 'Cari ' + an.name, icon: 'search', run: () => go('#search/' + encodeURIComponent(an.name)) });
     if (t.album && t.album.id) items.push({ label: 'Buka album', icon: 'lib', run: () => go('#album/' + t.album.id) });
     if (t.src !== 'file') items.push({ label: 'Bagikan', icon: 'share', run: () => share(t.title, shareUrl('#t=' + key(t))) });
     if (t.src === 'yt' || t.src === 'sp') items.push({ label: t.src === 'yt' ? 'Buka di YouTube Music' : 'Buka di Spotify', icon: t.src === 'yt' ? 'yt' : 'sp', run: () => open(extUrl(t), '_blank', 'noopener') });
@@ -787,7 +917,24 @@
   }
   async function playColl(ref, opt) {
     opt = opt || {};
-    if (Q.ctx && Q.ctx.ref === ref && !opt.shuffle && Engine.eng) { togglePlay(); return; }
+    if (Q.ctx && Q.ctx.ref === ref && !opt.shuffle && (Engine.eng || Engine.bridging())) { if (!isLoading()) togglePlay(); return; }
+    // A mix starts with its own song at once; the similar songs join the queue when they arrive (the audio server needs
+    // up to tens of seconds for that list, the tap must not wait for it).
+    if (ref.startsWith('mix:')) {
+      const id = ref.slice(4), h = S.hist.find((x) => x.t && x.t.src === 'yt' && x.t.id === id);
+      if (h) {
+        const seed = Object.assign({}, h.t);
+        setQueue([seed], 0, { name: 'Mix ' + ((seed.artists && seed.artists[0] || {}).name || seed.title), href: '#home', ref, thumb: seed.thumb }, {});
+        API.radio(id).then((l) => {
+          if (!Q.ctx || Q.ctx.ref !== ref) return;
+          const have = new Set(Q.list.map(key)), add = l.filter((x) => !have.has(key(x)));
+          if (!add.length) return;
+          Q.list.push(...add.map((x) => Object.assign({}, x)));
+          saveQ(); renderPanel(); prefetchNext();
+        }, () => {});
+        return;
+      }
+    }
     try {
       const c = await collTracks(ref);
       if (!c.tracks.length) return toast('Koleksi kosong', 'err');
@@ -864,10 +1011,11 @@
         if (!c.tracks.length) { sec.remove(); return; }
         row.innerHTML = songCards(c.tracks.slice(0, 24), { name: c.name, href: c.href, ref, thumb: c.thumb });
         $$('.card', row).forEach((el, j) => { const t = $('.t', el); if (t) t.insertAdjacentHTML('afterbegin', `<b class="rk">${j + 1}</b>`); });
+        watchVisible(false);
       }).catch(() => sec.remove());
     });
   }
-  const songCards = (tracks, ctx) => { const lid = regList(tracks, ctx); return tracks.map((t, i) => `<div class="card" data-l="${lid}" data-i="${i}"><div class="cv"${bg(t.thumb)}><button class="pb" data-act="ps">${icon('play')}</button></div><div class="t">${esc(t.title)}</div><div class="s">${esc(artistsText(t))}</div></div>`).join(''); };
+  const songCards = (tracks, ctx) => { const lid = regList(tracks, ctx), ck = curKey(), on = Engine.playing(); return tracks.map((t, i) => `<div class="card${key(t) === ck ? ' cur' + (on ? ' playing' : '') : ''}" data-l="${lid}" data-i="${i}" data-k="${esc(key(t))}"><div class="cv"${bg(t.thumb)}><button class="pb" data-act="ps">${icon(key(t) === ck && on ? 'pause' : 'play')}</button></div><div class="t">${esc(t.title)}</div><div class="s">${esc(artistsText(t))}</div></div>`).join(''); };
   const TR = { 'Songs': 'Lagu', 'Videos': 'Video', 'Albums': 'Album', 'Artists': 'Artis', 'Playlists': 'Playlist', 'Community playlists': 'Playlist komunitas', 'Featured playlists': 'Playlist pilihan', 'Top songs': 'Lagu populer', 'Singles & EPs': 'Single & EP', 'Singles': 'Single', 'Live performances': 'Penampilan live', 'Featured on': 'Ditampilkan di', 'Fans might also like': 'Penggemar juga menyukai', 'Releases for you': 'Rilisan untukmu', 'Other versions': 'Versi lain', 'More from': 'Lainnya dari', 'Episodes': 'Episode' };
   const tr = (t) => TR[t] || String(t || '').replace(/^Playlists by /, 'Playlist oleh ').replace(/^More from /, 'Lainnya dari ');
   const shelf = (title, inner, more) => `<section class="shelf"><div class="shelf-h"><h2>${esc(tr(title))}</h2>${more || ''}</div><div class="row">${inner}</div></section>`;
@@ -912,6 +1060,7 @@
     const t = view.dataset.tint;
     if (t) view.style.setProperty('--tint', t);
     markCur();
+    watchVisible(true);
   }
   async function tintView(url, tok) { const t = await tintOf(url); if (tok === rtok) view.style.setProperty('--tint', t); }
 
@@ -1207,6 +1356,7 @@
 
   // ---------------------------------------------------------------- delegated clicks
   document.addEventListener('click', async (e) => {
+    if (e.target.closest('[data-hap]')) return;   // the haptic switch's own click
     const a = e.target.closest('[data-act]');
     const act = a && a.dataset.act;
     const tr = e.target.closest('.tr');
@@ -1216,24 +1366,28 @@
       const i = +tr.dataset.i, t = L.tracks[i];
       if (act === 'like') return toggleLike(t);
       if (act === 'more') return trackMenu(t, a, { my: L.ctx.my, i });
-      if (e.target.closest('a')) return;
-      if (act === 'play' || touch) return playFrom(L, i);
+      // touch: the whole row plays — the artist name under the title is where a thumb lands most, and it used to open
+      // the artist instead (still in the ⋯ menu)
+      if (e.target.closest('a')) { if (!touch) return; e.preventDefault(); }
+      if (act === 'play' || touch) { haptic(); return playFrom(L, i); }
       $$('.tr.sel').forEach((x) => x.classList.remove('sel'));
       tr.classList.add('sel');
       return;
     }
     if (act === 'ps') {
       const c = a.closest('[data-l]'); const L = LISTS.get(c.dataset.l);
+      haptic();
       if (L) playFrom(L, +c.dataset.i);
       return;
     }
+    // playlist / album / mix: its songs may take a moment to arrive — the pressed button spins until the music starts
     if (act === 'pc') {
       e.stopPropagation();
       const c = a.closest('[data-ref]');
+      haptic(); markPend(a);
       return playColl(c.dataset.ref);
     }
-    if (act === 'pcoll') return playColl(a.dataset.ref);
-    if (act === 'pshuf') return playColl(a.dataset.ref, { shuffle: true });
+    if (act === 'pcoll' || act === 'pshuf') { haptic(); markPend(a); return playColl(a.dataset.ref, act === 'pshuf' ? { shuffle: true } : undefined); }
     if (act === 'save') { toggleSaved({ ref: a.dataset.ref, title: a.dataset.title, thumb: a.dataset.thumb, href: a.dataset.href, sub: a.dataset.sub }); a.classList.toggle('on', isSaved(a.dataset.ref)); $('use', a).setAttribute('href', isSaved(a.dataset.ref) ? '#i-heartf' : '#i-heart'); return; }
     if (act === 'moreColl') return collMenu(a.dataset.ref, a, { title: a.dataset.title, thumb: a.dataset.thumb, href: a.dataset.href, sub: '' });
     if (act === 'radioArtist') { const L = [...LISTS.values()].find((x) => x.tracks.length); if (L) startRadio(L.tracks[0]); return; }
@@ -1261,17 +1415,18 @@
     if (gen) return go('#search/' + encodeURIComponent(gen.dataset.genre + (/(Pop|Hits|Galau|Akustik|Indie|90an|2000an)/.test(gen.dataset.genre) ? ' playlist' : '')) + '/playlists');
 
     const qi = e.target.closest('[data-qi]');
-    if (qi && !e.target.closest('a')) { const i = +qi.dataset.qi; if (i === Q.i) togglePlay(); else { Q.i = i; startCur(); } return; }
+    if (qi && !e.target.closest('a')) { haptic(); const i = +qi.dataset.qi; if (i === Q.i) { if (!isLoading()) togglePlay(); } else { Q.i = i; startCur(); } return; }
 
     const cardEl = e.target.closest('.card, .mini-tr[data-href]');
     if (cardEl && !e.target.closest('a')) {
       if (cardEl.dataset.href) return go(cardEl.dataset.href);
-      if (cardEl.dataset.ref) return playColl(cardEl.dataset.ref);
+      haptic();
+      if (cardEl.dataset.ref) { markPend($('.pb, .playbtn', cardEl)); return playColl(cardEl.dataset.ref); }
       if (cardEl.dataset.l) { const L = LISTS.get(cardEl.dataset.l); if (L) playFrom(L, +cardEl.dataset.i); }
       return;
     }
     const best = e.target.closest('.best[data-l]');
-    if (best) { const L = LISTS.get(best.dataset.l); if (L) playFrom(L, 0); }
+    if (best) { haptic(); const L = LISTS.get(best.dataset.l); if (L) playFrom(L, 0); }
   });
   document.addEventListener('dblclick', (e) => {
     const tr = e.target.closest('.tr');
@@ -1294,7 +1449,8 @@
 
   function playFrom(L, i) {
     const t = L.tracks[i];
-    if (curKey() === key(t) && Engine.eng && (!L.ctx.ref || (Q.ctx && Q.ctx.ref === L.ctx.ref))) return togglePlay();
+    // the same song again: pause/resume — unless it is still on its way, then the second tap must not cancel it
+    if (curKey() === key(t) && (Engine.eng || Engine.bridging()) && (!L.ctx.ref || (Q.ctx && Q.ctx.ref === L.ctx.ref))) return isLoading() ? undefined : togglePlay();
     if (t.src === 'radio') return setQueue(L.tracks, i, { name: 'Radio', href: '#radio' }, { shuffle: false });
     setQueue(L.tracks, i, L.ctx && L.ctx.name ? { name: L.ctx.name, href: L.ctx.href, ref: L.ctx.ref, thumb: L.ctx.thumb } : null, { random: false });
   }
@@ -1404,7 +1560,8 @@
     p = p == null ? Engine.playing() : p;
     for (const b of ctlPlay) $('use', b).setAttribute('href', p ? '#i-pause' : '#i-play');
     $$('.tl').forEach((t) => t.classList.toggle('paused', !p));
-    $$('.card').forEach((c) => { const on = p && Q.ctx && c.dataset.ref === Q.ctx.ref; c.classList.toggle('playing', !!on); const u = $('.pb use', c); if (u && c.dataset.ref) u.setAttribute('href', on ? '#i-pause' : '#i-play'); });
+    const ck = curKey();
+    $$('.card').forEach((c) => { const on = p && (c.dataset.k ? c.dataset.k === ck : Q.ctx && c.dataset.ref === Q.ctx.ref); c.classList.toggle('playing', !!on); const u = $('.pb use', c); if (u && (c.dataset.ref || c.dataset.k)) u.setAttribute('href', on ? '#i-pause' : '#i-play'); });
     $$('[data-act="pcoll"]').forEach((b) => $('use', b).setAttribute('href', p && Q.ctx && Q.ctx.ref === b.dataset.ref ? '#i-pause' : '#i-play'));
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = p ? 'playing' : 'paused';
     renderPip();
@@ -1421,6 +1578,7 @@
   function markCur() {
     const k = curKey();
     $$('.tr').forEach((r) => r.classList.toggle('cur', r.dataset.k === k));
+    $$('.card[data-k]').forEach((c) => c.classList.toggle('cur', c.dataset.k === k));
   }
   let lastTintFor = '';
   function renderNow() {
@@ -1465,7 +1623,7 @@
     if (v && Engine.eng === 'au' && curSpec && curSpec.ar) { toast('Video memakai pemutar YouTube — bisa ada iklan. Matikan Video untuk kembali bebas iklan.'); curSpec = { eng: 'yt', id: curSpec.ar }; Engine.load(curSpec, { autoplay: Engine.playing(), start: Engine.time() }); }
     else if (!v && Engine.eng === 'yt' && adFreeOn() && curSpec && curSpec.id) {
       const id = curSpec.id, at = Engine.time(), was = Engine.playing(), tok = playTok;
-      adFreeUrl(id).then((url) => { if (url && tok === playTok && !isVideoMode()) { curSpec = { eng: 'au', url, ar: id }; Engine.load(curSpec, { autoplay: was, start: at, startMs: startLimit() }); } });
+      adFreeUrl(id, false, true).then((url) => { if (url && tok === playTok && !isVideoMode()) { curSpec = { eng: 'au', url: directOf(id) || url, api: url, ar: id }; Engine.load(curSpec, { autoplay: was, start: at, startMs: startLimit() }); } });
     }
     renderNow();
   }
@@ -1571,9 +1729,9 @@
 
   // bar buttons
   const bind = (ids, f) => ids.forEach((id) => { $(id).onclick = f; });
-  bind(['#cPlay', '#fPlay'], togglePlay);
-  bind(['#cNext', '#fNext'], () => next(false));
-  bind(['#cPrev', '#fPrev'], prev);
+  bind(['#cPlay', '#fPlay'], () => { haptic(); togglePlay(); });
+  bind(['#cNext', '#fNext'], () => { haptic(); next(false); });
+  bind(['#cPrev', '#fPrev'], () => { haptic(); prev(); });
   bind(['#cShuf', '#fShuf'], toggleShuffle);
   bind(['#cRep', '#fRep'], cycleRepeat);
   bind(['#bLike', '#fLike'], () => toggleLike(cur()));
@@ -1963,7 +2121,7 @@
   if ('mediaSession' in navigator) {
     const ms = navigator.mediaSession, h = (a, f) => { try { ms.setActionHandler(a, f); } catch (e) { /* unsupported */ } };
     h('play', () => { if (!Engine.playing()) togglePlay(); });
-    h('pause', () => Engine.pause());
+    h('pause', () => { if (Engine.playing()) pauseNow(); });
     h('previoustrack', prev);
     h('nexttrack', () => next(false));
     h('seekto', (d) => Engine.seek(d.seekTime));
@@ -2196,16 +2354,50 @@
     renderNow(); saveQ();
     return true;
   }
-  // hovering (or pressing) a song warms its ad-free stream, so the click starts it sooner
+  // hovering (or pressing) a song warms its ad-free stream, so the click starts it sooner; pressing a playlist's card
+  // starts loading its songs and the first song's stream (the click comes ~100–300 ms later)
   let hoverT = 0;
+  const trackAt = (el) => { const l = el.closest('[data-l]'); const L = l && LISTS.get(l.dataset.l); return L && L.tracks[+el.dataset.i]; };
   const warm = (e) => {
-    const el = e.target.closest && e.target.closest('.tr[data-i], [data-l][data-i]');
-    if (!el || !adFreeOn() || cloudDown()) return;
-    const L = LISTS.get((el.closest('[data-l]') || {}).dataset ? el.closest('[data-l]').dataset.l : '');
-    const t = L && L.tracks[+el.dataset.i];
-    const id = t && (t.src === 'yt' ? (ALT[t.id] || t.id) : t.src === 'sp' && S.set.spMode === 'yt' ? S.match[t.id] : null);
-    if (id) adFreeUrl(id);
+    if (!e.target.closest || !adFreeOn() || cloudDown()) return;
+    const el = e.target.closest('.tr[data-i], [data-l][data-i]');
+    if (el) { const t = trackAt(el), id = t && warmId(t); if (id) adFreeUrl(id, false, true); return; }
+    const c = e.target.closest('[data-ref]');
+    if (c && c.dataset.ref && e.type === 'pointerdown') warmColl(c.dataset.ref);
   };
+  function warmColl(ref) {
+    if (ref.startsWith('mix:')) { adFreeUrl(ref.slice(4), false, true); return; }   // a mix starts with its own song
+    collTracks(ref).then((c) => { const id = !S.shuffle && c.tracks[0] && warmId(c.tracks[0]); if (id) adFreeUrl(id, false, true); }, () => {});
+  }
+  // Touch screens have no hover to warm a song before the tap: songs that stay on screen for a moment get their stream
+  // looked up in the background (two at a time, at most a dozen per page), so the tap starts them at once.
+  const seen = touch && 'IntersectionObserver' in window ? new IntersectionObserver((ents) => {
+    for (const en of ents) {
+      const el = en.target;
+      if (en.isIntersecting) el._pv = setTimeout(() => { seen.unobserve(el); pvAdd(el); }, 700);
+      else clearTimeout(el._pv);
+    }
+  }, { threshold: 0.6 }) : null;
+  const pvQ = [];
+  let pvLeft = 0, pvBusy = 0;
+  function pvAdd(el) {
+    if (!el.isConnected) return;
+    const t = trackAt(el), id = t && warmId(t);
+    if (id && !AF.has(id) && !pvQ.includes(id)) { pvQ.push(id); pvRun(); }
+  }
+  function pvRun() {
+    while (pvBusy < 2 && pvQ.length && pvLeft > 0) {
+      const id = pvQ.shift();
+      if (AF.has(id) || !adFreeOn() || cloudDown() || document.hidden) continue;
+      pvBusy++; pvLeft--;
+      adFreeUrl(id, false, false, true).then(() => { pvBusy--; pvRun(); });
+    }
+  }
+  function watchVisible(newPage) {
+    if (!seen) return;
+    if (newPage) { seen.disconnect(); pvQ.length = 0; pvLeft = 12; }
+    $$('#view .tr[data-i], #view .card[data-l][data-i]').forEach((el) => { if (!el._pvw) { el._pvw = 1; seen.observe(el); } });
+  }
   document.addEventListener('pointerover', (e) => { clearTimeout(hoverT); if (!touch && e.target.closest && e.target.closest('.pi, .pb')) hoverT = setTimeout(() => warm(e), 300); }, { passive: true });
   document.addEventListener('pointerdown', warm, { passive: true, capture: true });
   Engine.ytInit().catch(() => { /* loads again on first YouTube song */ });
