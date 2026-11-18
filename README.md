@@ -3,6 +3,12 @@
 Pemutar musik web di **https://amatu-id.github.io/playlist/** (bagian dari Portal AMATU).
 
 - **Bebas iklan**: lagu YouTube diputar sebagai audio Hi-Fi langsung dari web lewat server Invidious publik (CORS + Range, bisa seek, EQ langsung aktif); lagu berikutnya disiapkan lebih awal. Server tidak tersedia → upload lain, lalu pemutar YouTube (bisa ada iklan). Tidak memakai MacBook sama sekali.
+- **Tanpa MacBook, 100% dari web**: semua yang dipakai saat memutar adalah layanan cloud publik — halaman di GitHub Pages, audio dari server Invidious (`yt.chocolatemoo53.com` + node `yt-comp*`), katalog/lirik lewat Supabase Edge Function, lirik lrclib, sampul i.ytimg / googleusercontent / scdn, pemutar YouTube sebagai cadangan. Tidak ada relay, tunnel, localhost, atau alamat di MacBook.
+- **Penjaga putar + refresh otomatis**: lagu yang masih memuat lama (30 dtk komputer / 45 dtk HP) atau waktunya diam padahal musik diminta (16 dtk) dimulai ulang dari nol di detik yang sama (link baru, koneksi baru); bila tetap macet, halaman me-refresh dirinya sendiri lalu langsung melanjutkan lagu yang sama di detik yang sama (paling banyak 3× per 30 menit; tidak saat sedang mengetik/ada dialog, tidak di HP yang layarnya mati — di sana mulai ulang saja sampai layar dilihat). Catatan tindakan di perangkat: `localStorage['pt.pl.diag']`.
+- **Lagu berikutnya di memori** (`js/pre.js`): beberapa detik setelah lagu berbunyi, lagu berikutnya diunduh utuh (±3–8 MB) → mulai ±0,3 dtk, juga saat HP terkunci (pergantian lagu tanpa jaringan). Stream yang tersendat/macet di tengah lagu pindah ke salinan memori di detik yang sama. Unduhan berhenti sementara saat lagu lain sedang dimulai.
+- **Sampul dimuat saat terlihat**: Beranda punya ±200 sampul; dulu dimuat sekaligus dan stream lagu (prioritas rendah di Chrome) antre di belakangnya 8–10 dtk sebelum dikirim ke server. Kini hanya sampul yang dekat layar (rak geser dimuat per rak).
+- **Upload pengganti yang benar**: server menolak sebagian art track (mis. Deep Purple/Eagles/Dire Straits) dan sebagian upload hanya memberi 1 MB pertama (403 "Maybe Youtube blocked the IP of this proxy?"); itu dikenali cepat lalu dicari video resmi lagu yang sama (judul + penyanyi + durasi cocok; cover/karaoke/remix/instrumental ditolak, live dihindari).
+- Batas tunggu server 15 dtk (server butuh 2–7 dtk per lagu baru); satu jawaban lambat tidak lagi menandai server "mati" (perlu 2× berturut-turut). Selama lagu dimulai tidak ada pencarian lain ke server (lagu di layar, lagu berikutnya, alamat node) — di iPhone ini memangkas 15–16 dtk menjadi 6–12 dtk untuk lagu yang belum pernah diputar.
 - Lagu penuh dari YouTube / YouTube Music, playlist & tangga lagu Spotify (dicocokkan otomatis ke lagu penuh, atau diputar lewat Spotify embed / preview Hi-Fi).
 - Beranda kurasi: rak lagu chart live (Top 50 Indonesia harian, trending YouTube Indonesia, Top 100 Songs Global, Today's Top Hits), Tangga Lagu Indonesia, Terpopuler Minggu Ini, Baru & Lagi Naik, Viral & Joget, K-Pop/J-Pop, Genre Dunia, Religi, Pop Indonesia, Pop Jazz & City Pop, lagu hits lainnya, hits dunia.
 - Koleksi rock (`#rock/legend`, `#rock/viral`, `#rock/terbaik`): lagu dan album Rock Legend, Pop Rock Viral, Rock Terbaik Sepanjang Masa, di rak Beranda dan kotak genre. Daftar kurasi ada di `tools/gen-rock.py`, hasilnya `js/rock.js` (jalankan ulang setelah mengubah daftar, naikkan `?v`).
@@ -20,6 +26,6 @@ Pemutar musik web di **https://amatu-id.github.io/playlist/** (bagian dari Porta
 - Radio internet Indonesia & dunia (radio-browser.info), file audio lokal.
 - Pustaka: Lagu yang Disukai, playlist sendiri, koleksi tersimpan, riwayat, statistik, impor/ekspor JSON.
 
-Struktur: `index.html`, `css/app.css`, `js/{data,fx,api,gap,engine,app}.js`, `eq.html`.
+Struktur: `index.html`, `css/app.css`, `js/{data,rock,fx,api,gap,pre,engine,app}.js`, `eq.html`.
 Katalog lewat Supabase Edge Function `amatu-music` (`supabase/functions/amatu-music`), deploy:
 `supabase functions deploy amatu-music --project-ref ieyqxmzztoxgpvwexbkj --no-verify-jwt --use-api`.

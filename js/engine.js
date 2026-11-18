@@ -57,17 +57,20 @@ window.Engine = (function () {
   // audio session only while something plays — so between the tap (or the end of a song) and the first sound of the
   // next one, this element keeps both alive.
   const SPARE = !PHONE && !/^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-  const au = { el: new Audio(), raw: new Audio(), spare: new Audio(), keep: new Audio(), spareUrl: '', ctx: null, fx: null, a: null, live: false, src: '', bridging: false, noCors: '' };
+  const au = { el: new Audio(), raw: new Audio(), spare: new Audio(), keep: new Audio(), spareUrl: '', ctx: null, fx: null, a: null, live: false, src: '', bridging: false, noCors: '', ar: false };
   for (const a of [au.el, au.spare]) a.crossOrigin = 'anonymous';
   for (const a of [au.el, au.raw, au.spare, au.keep]) a.preload = 'auto';
   au.keep.loop = true;
   const main = () => (noGraph() || au.noCors === au.src ? au.raw : au.el);
   const isCur = (a) => cur === 'au' && au.a === a && !au.bridging;
-  const fresh = (u) => u.replace(/([?&])_r=[^&]*&?/, '$1').replace(/[?&]$/, '') + (u.includes('?') ? '&' : '?') + '_r=' + Date.now().toString(36);
+  // a song held in memory (blob:) needs no network: no start limit, no new address
+  const local = (u) => /^(blob|data):/.test(u || '');
+  const fresh = (u) => local(u) ? u : u.replace(/([?&])_r=[^&]*&?/, '$1').replace(/[?&]$/, '') + (u.includes('?') ? '&' : '?') + '_r=' + Date.now().toString(36);
   for (const a of [au.el, au.raw, au.spare]) {
     a.addEventListener('playing', () => { if (isCur(a)) { wd.began = true; if (keeping) keepStop(); emit('state', true); } });
     a.addEventListener('pause', () => { if (isCur(a)) emit('state', false); });
-    a.addEventListener('waiting', () => { if (isCur(a)) emit('buffering'); });
+    // mid-song: the element ran out of data (the app counts these to tell a stuttering stream)
+    a.addEventListener('waiting', () => { if (isCur(a)) emit('buffering', wd.began && !a.seeking && !au.live); });
     a.addEventListener('ended', () => { if (isCur(a)) { emit('state', false); finish(); } });
     a.addEventListener('loadedmetadata', () => { if (isCur(a)) { wd.prog = performance.now(); emit('meta'); } });
     // any sign of life of a starting stream counts: iPhone's player asks for a few small pieces before the music data
@@ -79,6 +82,7 @@ window.Engine = (function () {
     // CORS refused (common for radio) → play untouched without FX
     if (au.live || au.src.startsWith('http')) {
       const at = au.el.currentTime;
+      if (au.ar && /^https?:/.test(au.src)) au.src = fresh(au.src);   // its own address, see load()
       au.noCors = au.src;
       au.a = au.raw; au.raw.src = au.src;
       if (at && !au.live) startAt(au.raw, at);
@@ -228,6 +232,7 @@ window.Engine = (function () {
     const t = au.a.currentTime, on = !au.a.paused, o = au.a;
     if (m === au.el) { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); }
     o.pause(); o.removeAttribute('src');
+    if (au.ar && /^https?:/.test(au.src)) au.src = fresh(au.src);   // its own address, see load()
     au.a = m; m.loop = false; m.src = au.src;
     if (t && !au.live) startAt(m, t);
     applyVol(); applyRate();
@@ -262,8 +267,8 @@ window.Engine = (function () {
       else p.cueVideoById({ videoId: spec.id, startSeconds: start });
       applyVol();
     } else if (spec.eng === 'au') {
-      au.live = !!spec.live; au.src = spec.url;
-      au.startMs = opt.startMs || 0; wd.began = false; wd.loadAt = performance.now();
+      au.live = !!spec.live; au.src = spec.url; au.ar = !!spec.ar;
+      au.startMs = local(spec.url) ? 0 : opt.startMs || 0; wd.began = false; wd.loadAt = performance.now();
       let a = main();
       const o = a === au.el ? au.raw : au.el;
       if (a === au.el) { fxInit(); if (au.ctx.state === 'suspended') au.ctx.resume(); }
@@ -274,7 +279,11 @@ window.Engine = (function () {
         old.pause(); old.removeAttribute('src'); old.load();
         a = au.el;
       } else {
-        a.src = spec.url;
+        // Every load of a song's stream gets an address of its own. Chrome holds a request back while an earlier one
+        // for the same address (even one cancelled a moment ago) still owns its cache entry: the same song loaded twice
+        // in a row (resume + tap, a double tap, a retry) stayed silent for 6–7 s until the start limit gave it a new one.
+        if (spec.ar && /^https?:/.test(spec.url)) { const was = au.src; au.src = fresh(spec.url); if (au.noCors === was) au.noCors = au.src; }
+        a.src = au.src;
       }
       au.a = a; a.loop = false;
       if (start) startAt(a, start);
@@ -383,9 +392,9 @@ window.Engine = (function () {
   // ---------- keep playing: the page wants music unless the user paused it. A song the browser or YouTube paused
   // on its own (window minimized, tab in the background, audio device change) is resumed, and a stream that stops
   // advancing (audio server / radio connection dropped) is reconnected at the same spot, then handed to the error path.
-  let want = false, plan = null, endSent = false;
-  const wd = { t: -1, at: 0, fixes: 0, resumes: [], seekAt: 0, flat: 0, quiet: 0, ctxBad: 0, began: false, loadAt: 0, prog: 0, keepAt: 0 };
-  function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; wd.seekAt = 0; wd.flat = 0; wd.quiet = 0; wd.ctxBad = 0; }
+  let want = false, plan = null, endSent = false, rescue = null;
+  const wd = { t: -1, at: 0, fixes: 0, resumes: [], seekAt: 0, flat: 0, quiet: 0, ctxBad: 0, began: false, loadAt: 0, prog: 0, keepAt: 0, rescued: false };
+  function resetWd() { wd.t = -1; wd.at = performance.now(); wd.fixes = 0; wd.seekAt = 0; wd.flat = 0; wd.quiet = 0; wd.ctxBad = 0; wd.rescued = false; }
   function finish() { if (endSent) return; endSent = true; emit('end'); }
   function resume() {
     const now = performance.now(), win = document.hidden ? 600e3 : 60e3;   // another app taking the audio on a phone must win
@@ -403,8 +412,9 @@ window.Engine = (function () {
   }
   setInterval(followPlan, 400);
   // Volume stuck low though nothing is fading: whatever left it there, the song must be heard.
+  // (Not while a stream is still starting: its fade-in waits for the first sound.)
   function volumeGuard() {
-    if (fadeK > 0.99 || fadeDone || !playing()) { wd.flat = 0; return; }
+    if (fadeK > 0.99 || fadeDone || !playing() || (cur === 'au' && !wd.began)) { wd.flat = 0; return; }
     if (++wd.flat >= 3) { wd.flat = 0; fade(1, 300); emit('fadefix'); }
   }
   // The element runs but nothing comes out of Web Audio: first wake it, then play without it. Digital silence for
@@ -460,13 +470,23 @@ window.Engine = (function () {
         emit('error', { eng: 'au', code: 'start' });
         return;
       }
-      if (a.seeking && (!wd.seekAt || now - wd.seekAt < 10e3)) { wd.seekAt = wd.seekAt || now; wd.at = now; return; }
-      wd.seekAt = 0;
+      // A seek waits for the data at the new spot. It used to be excused for 10 s again and again, so a seek whose
+      // data never came stayed silent for good. Now: after 3.5 s the copy in memory takes over (if there is one),
+      // after 10 s it is a stall like any other (counted from the seek).
+      if (a.seeking) {
+        wd.seekAt = wd.seekAt || now;
+        const waited = now - wd.seekAt;
+        if (waited > 3500 && rescue && !local(au.src) && !wd.rescued) { wd.rescued = true; if (rescue(a.currentTime)) { wd.seekAt = 0; return; } }
+        if (waited < 10e3) { wd.at = now; wd.t = a.currentTime; return; }
+        wd.at = Math.min(wd.at, wd.seekAt);
+      } else wd.seekAt = 0;
       if (a.paused) { wd.loadAt = now; if (now - wd.at > 1500) resume(); return; }
       const t = a.currentTime;
       if (t !== wd.t) { wd.t = t; wd.at = now; outputGuard(a, t); return; }
       const d = duration();
       if (d && d - t < 2.5 && now - wd.at > 3000) { finish(); return; }   // the last bytes never came: the song is over anyway
+      // stopped mid-song for a few seconds while the app holds the whole song in memory: carry on from that copy at once
+      if (rescue && t > 0.5 && !local(au.src) && !wd.rescued && now - wd.at > 3500) { wd.rescued = true; if (rescue(t)) return; }
       if (now - wd.at < (t > 0.5 ? 8e3 : 15e3) || navigator.onLine === false) return;
       wd.at = now;
       if (wd.fixes++ < 1) {
@@ -475,6 +495,7 @@ window.Engine = (function () {
         if (au.startMs) { const was = au.src; au.src = fresh(was); if (au.noCors === was) au.noCors = au.src; wd.began = false; wd.loadAt = now; }
         a.src = a === au.raw && !au.startMs ? au.raw.src : au.src;
         if (t && !au.live) startAt(a, t);
+        wd.seekAt = 0;   // the new connection's own seek gets its own time
         a.play().catch(() => {});
       } else emit('error', { eng: 'au', code: 'stall' });
     }
@@ -485,7 +506,26 @@ window.Engine = (function () {
     if (!document.hidden && au.ctx && au.ctx.state !== 'running' && cur === 'au') au.ctx.resume();
   });
 
+  // The song goes on from another address of the same audio (its copy in memory) at the same second, on the same
+  // element: no new start, no fade, the lock screen and the EQ stay as they are.
+  function swap(url) {
+    if (cur !== 'au' || !au.a || au.bridging || au.live || !url || url === au.src) return false;
+    const a = au.a, t = a.currentTime || 0;
+    if (au.noCors === au.src) au.noCors = url;
+    au.src = url;
+    if (local(url)) au.startMs = 0;
+    a.src = url;
+    if (t) startAt(a, t);
+    resetWd(); wd.began = false; wd.loadAt = performance.now();
+    applyVol(); applyRate();
+    if (want) a.play().catch(() => { /* reported through the element */ });
+    return true;
+  }
+
   return {
+    swap, setRescue(f) { rescue = f; },
+    src: () => (cur === 'au' && !au.bridging ? au.src : ''),
+    bufferedEnd() { const a = cur === 'au' && !au.bridging && au.a; return a && a.buffered.length ? a.buffered.end(a.buffered.length - 1) : 0; },
     on, load, play: () => play(), pause, began: () => wd.began, unlock, bridge, canAutoplay, phone: PHONE, ios: IOS, noGraph, wanted: () => want, ytInit, playing, time, duration, buffered, seek, fade, useRaw, preload,
     setPlan(p) { plan = p && (p.end || p.skips.length) ? p : null; if (plan && !plan.end) endSent = false; },
     finish,
