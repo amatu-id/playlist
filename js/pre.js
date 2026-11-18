@@ -6,10 +6,10 @@
 window.Pre = (function () {
   const KEEP = 4;          // songs kept in memory
   const MAX = 22e6;        // longer uploads (hour-long mixes) keep streaming as before
-  const IDLE = 12e3;       // no byte for this long: ask again from where it stopped
+  const IDLE = 10e3;       // no byte for this long: ask again from where it stopped (another node)
   const M = new Map();     // video id → entry
   const pinned = new Set();
-  let active = null, held = false;
+  let active = null, held = false, reroute = null;
 
   const sizeOf = (u) => { try { return +new URL(u).searchParams.get('clen') || 0; } catch (e) { return 0; } };
   const settle = (e, v) => { for (const f of e.ready.splice(0)) f(v); };
@@ -94,7 +94,9 @@ window.Pre = (function () {
       }
     } catch (x) {
       if (held && e.prio < 3) e.paused = true;
-      else e.node = '';   // broke off: the next try goes through the server, which picks a node that works
+      // broke off or got nothing: the next try asks another node for the same link (the app knows them); else the
+      // server's own address again
+      else e.node = (reroute && reroute(e.node || e.url)) || '';
     } finally {
       clearTimeout(idle);
       e.ac = null;
@@ -135,6 +137,7 @@ window.Pre = (function () {
       if (!held) setTimeout(pump, 0);
     },
     drop,
+    setReroute(f) { reroute = f; },
     // a copy that failed to play is not used again for a while
     bad(id) { const e = M.get(id); if (!e) return; drop(id); M.set(id, Object.assign(e, { state: 'fail', at: Date.now(), ready: [], parts: null })); },
     debug: () => [...M.values()].map((e) => ({ id: e.id, st: e.state, p: e.size ? +(e.got / e.size).toFixed(2) : 0, prio: e.prio, mb: +(e.got / 1e6).toFixed(1) })),

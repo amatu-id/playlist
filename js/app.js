@@ -201,10 +201,10 @@
   }
 
   // ---------------------------------------------------------------- playback core
-  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, afAt = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0, failRun = 0;
+  let playTok = 0, fadeInMs = 0, curSpec = null, altTries = 0, afFix = 0, afAt = 0, listened = 0, counted = false, fadingOut = false, lastTick = 0, failRun = 0, nodeHops = 0;
   const tried = new Set();
   // penjaga (see "music that was asked for must be heard"): since when nothing is heard, fresh starts used, stutters
-  const G = { since: 0, lastT: -1, soft: 0, okAt: 0, stut: [], offAt: 0 };
+  const G = { since: 0, lastT: -1, soft: 0, okAt: 0, stut: [], offAt: 0, phase: '' };
   // What the player did to keep the music going, kept on this device only (pt.* never syncs), never shown: read it
   // with localStorage['pt.pl.diag'] when a problem has to be understood.
   const DIAG = 'pt.pl.diag';
@@ -328,6 +328,34 @@
     if (!VM.has(id)) VM.set(id, { sec: d.s || 0, scan: d.sc ? { url: d.sc[0], init: d.sc[1], index: d.sc[2] } : null });
     return { p: Promise.resolve(pageAddr(d.u)), t: d.at, direct: '' };
   }
+  // ---------------------------------------------------------------- the audio server's nodes
+  // A link names the node that issued it (issuer=…; the server's own address redirects there), but every node serves
+  // every link (checked 2026-11-18: one link from nodes 2, 3 and 5 gave byte-identical files). A node that hangs or
+  // answers 5xx is skipped for a few minutes and the song goes on from another node at the same second, without a new
+  // look-up — a new link names the same node again. (A refusal past the first megabyte belongs to the link: every node
+  // gives it, so that one goes to another upload instead.)
+  const NODES = [1, 2, 3, 4, 5, 6].map((n) => `yt-comp${n}.chocolatemoo53.com`);
+  const nodeBad = new Map();
+  const nodeOk = (h) => !(nodeBad.get(h) > Date.now());
+  function nodeOf(u) {
+    try { const x = new URL(u); if (NODES.includes(x.host)) return x.host; const i = x.searchParams.get('issuer'); return NODES.includes(i) ? i : ''; } catch (e) { return ''; }
+  }
+  function markNode(u) { const h = nodeOf(u); if (h && nodeOk(h)) { nodeBad.set(h, Date.now() + 300e3); note('node bad ' + h); } }
+  // the same link from another node that works ('' when none is left)
+  function onNode(u, but) {
+    try {
+      const x = new URL(u);
+      if (!/(^|\.)chocolatemoo53\.com$/.test(x.host)) return '';
+      const from = Math.max(0, NODES.indexOf(but));
+      for (let k = 1; k <= NODES.length; k++) {
+        const h = NODES[(from + k) % NODES.length];
+        if (h !== but && nodeOk(h)) { x.host = h; return x.href; }
+      }
+    } catch (e) { /* not a link of this server */ }
+    return '';
+  }
+  // a link to use now: as it is, unless its node is known to hang
+  const healthy = (u) => { const h = u && nodeOf(u); return h && !nodeOk(h) ? onNode(u, h) || u : u; };
   // The audio server answers every request with a redirect to the node that holds the stream, and iPhone's player asks
   // for three pieces one after another before the first sound, each paying for that extra trip to the US (a computer
   // pays it once per song and on every seek). The node's own address is learned once in the background (a plain GET:
@@ -385,7 +413,7 @@
     const url = await adFreeUrl(id, false, false);
     if (url && id !== t.id && tooLong(id, t)) return { eng: 'af', ar: id };
     // api: the server's own address, the fallback when the node's address (url) fails
-    return url ? { eng: 'au', url: directOf(id) || url, api: url, ar: id } : { eng: 'af', ar: id, why: AFWHY.get(id) || '' };
+    return url ? { eng: 'au', url: healthy(directOf(id) || url), api: url, ar: id } : { eng: 'af', ar: id, why: AFWHY.get(id) || '' };
   }
   // A replacement upload only lasts this visit: it is often another singer's recording, and the song's own upload (which
   // has its lyrics) usually works again later.
@@ -471,7 +499,7 @@
       if (pick) {
         useAlt(t, pick.alt);
         note('alt ' + pick.alt.id + ' for ' + t.id);
-        curSpec = { eng: 'au', url: directOf(pick.alt.id) || pick.url, api: pick.url, ar: pick.alt.id }; afFix = 0;
+        curSpec = { eng: 'au', url: healthy(directOf(pick.alt.id) || pick.url), api: pick.url, ar: pick.alt.id }; afFix = 0;
         Engine.load(curSpec, { autoplay: true, start: Q.t > 1 ? Q.t : 0, startMs: startLimit() });   // another upload carries on near the same second
         renderNow(); addHist(t); loadLyrics(t); scanSong(tok);
         return;
@@ -615,7 +643,7 @@
     const tok = ++playTok;
     fadeInMs = 0;
     if (disarmResume) disarmResume();
-    listened = 0; counted = false; fadingOut = false; altTries = 0; afFix = 0; tried.clear(); G.stut = [];
+    listened = 0; counted = false; fadingOut = false; altTries = 0; afFix = 0; nodeHops = 0; tried.clear(); G.stut = [];
     Q.t = opt.start || 0;
     setLoading(true);
     renderNow(); saveQ();
@@ -669,7 +697,23 @@
     const id = nx && nx.src !== 'radio' && nx.src !== 'file' && !wantsVideo(nx) && S.repeat !== 2 ? warmId(nx) : null;
     Pre.pin([curVid(), id]);
     if (!id || Pre.url(id)) return;
-    adFreeUrl(id, false, true).then((u) => { if (u && tok === playTok && !tooLong(id, nx)) Pre.want(id, u, 2); });
+    adFreeUrl(id, false, true).then((u) => {
+      if (tok !== playTok) return;
+      if (u && !tooLong(id, nx)) Pre.want(id, healthy(u), 2);
+      else if (!u && AFWHY.get(id) === 'answered' && nx.src === 'yt' && !ALT[nx.id]) altAhead(nx, tok);
+    });
+  }
+  // The next song's own upload is refused by the server: its stand-in (the music video, see altScore) is found and
+  // fetched now, while this song plays, instead of after a search at the moment the song is due.
+  async function altAhead(nx, tok) {
+    const d = await API.search(altQuery(nx), 'videos').catch(() => null);
+    if (tok !== playTok || !d) return;
+    const cands = API.tracksOf(d.items).filter((x) => x.id !== nx.id).map((x) => ({ x, s: altScore(nx, x) })).filter((c) => c.s >= 4).sort((a, b) => b.s - a.s).slice(0, 2).map((c) => c.x);
+    for (const c of cands) {
+      const u = await adFreeUrl(c.id, false, true);
+      if (tok !== playTok) return;
+      if (u && !tooLong(c.id, nx)) { useAlt(nx, c); note('alt ahead ' + c.id + ' for ' + nx.id); Pre.pin([curVid(), c.id]); Pre.want(c.id, healthy(u), 2); return; }
+    }
   }
   // this song from its copy in memory, same second (fetched first if needed)
   function memCur(why) {
@@ -677,13 +721,15 @@
     if (!id || !spec || spec.mem || spec.eng !== 'au' || spec.live || !spec.ar) return;
     const link = spec.api || spec.url;
     Pre.pin([id, warmId(nextTrack() || {})]);
-    Pre.want(id, link, 3).then((u) => {
+    Pre.want(id, healthy(link), 3).then((u) => {
       if (!u || tok !== playTok || curSpec !== spec || Engine.src() === u) return;
       note('mem ' + why + ' ' + id);
       curSpec = Object.assign({}, spec, { url: u, mem: true, api: link });
       Engine.swap(u);
     });
   }
+  // a download that got nothing for a while: its node is skipped, the download goes on from another one
+  Pre.setReroute((u) => { markNode(u); return onNode(u, nodeOf(u)); });
   // the engine saw the time stand still mid-song: the copy in memory, if there is one, takes over at once
   Engine.setRescue(() => {
     const id = curVid(), u = id && Pre.url(id);
@@ -902,6 +948,17 @@
       setLoading(true);
       return afAlt(t, tok, 'answered');
     }
+    // the node hangs or fails: the same link from another node, same second (twice per song at most)
+    if ((hang || pr === 'dead') && nodeHops < 2) {
+      const from = nodeOf(spec.url), other = from && onNode(spec.url, from);
+      if (other) {
+        markNode(spec.url); nodeHops++;
+        setLoading(true);
+        curSpec = { eng: 'au', url: other, api: spec.api || spec.url, ar: id };
+        Engine.load(curSpec, { autoplay: true, start: at > 1 ? at : 0, startMs: startLimit() });
+        return;
+      }
+    }
     // the node's own address failed: the server's address sends the player to a node that works, no new lookup
     if (spec.api && spec.url !== spec.api) {
       dropDirect(id);
@@ -921,6 +978,10 @@
       if (!C.ok) return ytFallback(t, tok, at);
     }
     tried.add(id);
+    // Another song played from the server a moment ago: it is this upload's node that hangs or answers 502 (seen
+    // 2026-11-18, yt-comp3 for one song while the other nodes played), so another upload, which usually sits on
+    // another node, comes before the YouTube player.
+    if ((dead || hang) && Date.now() - lastAfOk < 600e3 && altTries < 2) { note('node ' + (hang ? 'hang' : 'dead') + ' ' + id); return afAlt(t, tok, 'answered'); }
     // the server can't be reached from here: another upload would fail the same way
     if (dead || hang) { C.hangAt = Date.now(); return ytFallback(t, tok, at); }
     return afAlt(t, tok);
@@ -961,8 +1022,9 @@
   });
   // other Amatu tabs drop their silent keep-alive (amatu.js) while a song plays here
   const audioBc = 'BroadcastChannel' in window ? new BroadcastChannel('amatu-audio') : null;
+  let lastAfOk = 0;   // when an ad-free stream last started to sound
   Engine.on('state', (p) => {
-    if (p && Engine.eng === 'au') C.hangAt = 0;
+    if (p && Engine.eng === 'au') { C.hangAt = 0; if (curSpec && curSpec.ar) lastAfOk = Date.now(); }
     if (p) { bgRetry = 0; failRun = 0; $('#rsm').hidden = true; if (audioBc) audioBc.postMessage('playing'); }
     // the song sounds: downloads go on, and a few seconds in the next song is fetched whole
     if (p) { clearTimeout(holdT); Pre.hold(false); }
@@ -2519,6 +2581,9 @@
     G.lastT = tm;
     if (moving) { G.since = 0; if (!G.okAt) G.okAt = now; else if (now - G.okAt > 120e3) G.soft = 0; return; }
     G.okAt = 0;
+    // a player that just took over (the YouTube player after the stream gave up) gets its own full time to start
+    const phase = (Engine.eng || '-') + (isLoading() ? 'L' : 'P');
+    if (phase !== G.phase) { const was = G.phase; G.phase = phase; if (phase.endsWith('P') && was) { G.since = now; return; } }
     if (!G.since) { G.since = now; return; }
     // a new song may take the server's lookup + a slow first byte + another upload: give the normal ways time first
     // (a little less once a fresh start didn't help either)
