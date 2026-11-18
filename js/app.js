@@ -2467,6 +2467,9 @@
     // a phone in the background: a reloaded page there can't start sound without a touch (and is frozen once silent),
     // while the keep-alive keeps this page going — fresh starts until the screen is looked at again
     if (Engine.phone && document.hidden) return false;
+    // the portal's idle lock (PIN after 15 min without a touch) keeps the music going behind the PIN, but a page loaded
+    // while locked goes to the portal sign-in instead of playing: no reload then
+    if (AMT && AMT.unlocked && !AMT.unlocked()) return false;
     const a = document.activeElement, tag = a ? (a.tagName || '').toLowerCase() : '';
     if (tag === 'input' || tag === 'textarea' || tag === 'select' || (a && a.isContentEditable)) return false;   // typing
     if (!modal.hidden) return false;
